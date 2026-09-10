@@ -118,11 +118,13 @@ npm run dev                    # http://localhost:3000
 use. `lib/schema.sql` is entirely idempotent, so it is safe to re-run on every
 deploy.
 
-> **Upgrading from the first version of this schema?** Re-run `npm run db:init`.
+> **Upgrading from an earlier version of this schema?** Re-run `npm run db:init`.
 > It renames `link_requests` to `device_requests` and adds the `action` and
 > `password_hash` columns inside a guarded `DO` block, so it is a no-op on a
 > fresh install and safe on an existing one. Any rows already in the table come
-> through as `action = 'link'`.
+> through as `action = 'link'`. The same run creates `bot_sessions`, which is
+> where the connected-numbers list comes from — until the bot starts syncing
+> into it, that list will be empty.
 
 ### Environment
 
@@ -136,6 +138,7 @@ deploy.
 | `VERIFY_IP_MAX` / `VERIFY_IP_WINDOW_MIN` | no | Password guesses allowed per IP across all numbers (default 12 per 15 min). |
 | `VERIFY_LOCKOUT_AFTER` / `VERIFY_LOCKOUT_MINUTES` | no | Wrong guesses against one number before it locks (default 5, for 15 min). |
 | `VERIFY_LOG_RETENTION_DAYS` | no | How long `password_attempts` is kept (default 7). |
+| `LEGACY_DEFAULT_PASSWORDS` | **yes** | Comma-separated primary passwords accepted for numbers that have none (default `1234,0000`). Empty disables the fallback. |
 | `IP_HASH_SALT` | recommended | Salt for hashing caller IPs before storage. |
 | `PGSSL_STRICT` | no | Set to `1` to enforce full TLS chain verification. |
 
@@ -170,6 +173,14 @@ const linkQueue = createLinkQueue({
   deleteDevice: async (msisdn) => {
     await logoutSession(msisdn)
     await rmSessionFolder(msisdn)
+  },
+
+  // Required for the website's connected-numbers list. Return the MSISDNs the
+  // bot currently holds a session folder for — anything missing here is
+  // invisible to the site.
+  listSessions: async () => {
+    const entries = await fs.readdir(SESSIONS_DIR, { withFileTypes: true })
+    return entries.filter((e) => e.isDirectory()).map((e) => e.name)
   },
 
   // Optional side effects when a device connects.
@@ -287,49 +298,89 @@ service.
 The lockout is reported as `rate_limited` with `scope: 'ip'` even when it was
 really the per-number lockout, so the two cannot be told apart from outside.
 
+### 4. Numbers paired before this site existed use a primary password
+
+Sessions that already existed were paired when nobody was asked for a password.
+Without a fallback they would be permanently un-deletable through this page, so
+`LEGACY_DEFAULT_PASSWORDS` (default `1234,0000`, either accepted) authorises them.
+
+**This is a public master key, and it is worth being blunt about it.** Anyone who
+knows those four digits can delete any session that has no password of its own.
+It is not a secret once it lives in a repository and is used by a page with no
+login. Two consequences follow:
+
+- It identifies legacy sessions. A wrong password and an unknown number return an
+  identical 401, so the failure path leaks nothing — but a *correct* `1234` tells
+  the caller that number is a session. That is a small disclosure the shared
+  default creates and the real-credential path does not have.
+- There is no per-number lockout on this path, because there is no credential row
+  to count against. Only the per-IP throttle applies. That is tolerable precisely
+  because the password is not a secret — but if you ever set it to something
+  meaningful, add the lockout first.
+
+The way out is to convert the numbers:
+
+```sql
+SELECT phone FROM bot_sessions_active WHERE has_password = false;
+```
+
+Relink those through this page, set a real password, and they stop accepting the
+defaults. Once that query returns nothing, set `LEGACY_DEFAULT_PASSWORDS=""` to
+switch the fallback off. That is the correct end state.
+
+The fallback only ever applies to a number that is an **active session**. An
+unknown number gets the same burn-time treatment and the same 401 as a wrong
+password, so this cannot be used to probe numbers the bot has never seen.
+
 ---
 
 ## Connected numbers
 
-The page shows the numbers this browser has linked, with the middle digits
-hidden:
+The page lists every number the bot currently holds a session for, with the
+middle digits hidden:
 
 ```
 254741388986  →  254741****86
 ```
 
-### Why it is scoped to the browser
+### ⚠ This list is public
 
-There is no login, so the server has no idea who "you" are. Two options existed:
-list every number connected to the bot, or list only the ones this browser
-linked. The second was chosen — a public list would expose your whole customer
-base to anyone who opens the page, and let a competitor watch it grow.
+There is no login and `GET /api/connected` takes no parameters, so **anyone who
+opens the page sees every connected number**. Be clear-eyed about what that
+means:
 
-The browser keeps only the opaque `public_id` of each link request it created,
-in `localStorage`. Those references are sent to `POST /api/connected`, which
-resolves them and returns the masked number and whether it is still connected.
-**A raw phone number is never stored in the browser and never returned by that
-endpoint.**
+- A visitor can count your customers and watch the count grow.
+- The mask keeps six leading and two trailing digits, so a specific entry can be
+  narrowed substantially by anyone who already half-knows a number.
+- A raw number is never sent — but a partial number is, and that is a real
+  exposure, not a theoretical one.
 
-Taking `public_id`s rather than phone numbers is deliberate: an endpoint that
-accepted numbers would be an enumeration oracle — post a range and learn which
-ones are customers. A `public_id` is 24 random characters, so a caller can only
-ask about numbers it already holds a reference to.
+If that is not acceptable, this endpoint is the one to gate. The earlier
+browser-scoped variant (each visitor saw only what they had linked) is in the
+git history if you want it back.
 
-### What "connected" means
+### Where the list comes from
 
-The existence of a `device_credentials` row. That table is written only after a
-device genuinely links, and the worker deletes the row when a device is removed,
-so it is a real register rather than a guess from request history.
+Not from the site. The session folders live on the bot's host inside
+`database/sessions/`, and this deployment is serverless with no filesystem
+access to them. So the bot publishes what it finds:
 
-Two ordering details make it trustworthy:
+```
+bot's database/sessions/*  →  listSessions()  →  bot_sessions table  →  GET /api/connected
+```
 
-- The worker **promotes the credential before** flipping the request to
-  `linked`, so a browser polling in that window can never see a freshly linked
-  number reported as not connected.
-- The worker **clears the credential before** marking a delete `completed`, so a
-  removed number drops off the list immediately — including when it was removed
-  from a *different* browser, because the check is server-side.
+The worker re-scans on an interval (`sessionSyncMs`, default 60s), upserts every
+number it finds, and stamps `removed_at` on anything no longer present. Rows are
+never deleted, so a number that comes back clears the stamp.
+
+**Whatever the bot does not report simply does not appear.** If the list is empty
+on a busy bot, the problem is almost always `listSessions` — not this site.
+
+One guard matters more than the rest: **an empty scan is ignored**. Empty almost
+always means the session directory could not be read (wrong working directory,
+permissions, an unmounted volume) rather than every user unlinking at once.
+Acting on it would wipe the whole public list, so the sync refuses and logs a
+warning instead. Recovery is automatic on the next good scan.
 
 ### Masking tiers
 
@@ -346,13 +397,17 @@ generous on an 8-digit one, so the reveal shrinks with the number:
 Every result hides at least one digit and preserves the length, so the shape of
 the number is still recognisable to its owner.
 
-### The limitation
+### Why the rows are keyed on a hash
 
-A number unlinked **directly inside WhatsApp** still reads as connected here.
-Nothing on this side can see that — the session folders live on the bot's host,
-and only `isLinked` knows. If you want those reconciled, have the worker's
-`checkLinks` loop also sweep `linked` rows whose `isLinked()` now returns false
-and clear their credential.
+Two different numbers can mask to the *same* string — the hidden digits are
+exactly the ones that differ, so `254741999986` and `254741888886` both render as
+`254741****86`. The masked form therefore cannot identify a row. Each entry
+carries an `id` derived from a SHA-256 of the number, which is stable across
+refreshes and unique even when the masks collide.
+
+That id is not a privacy control, and does not pretend to be: the masked number
+sits beside it in the same response, so reversing it reveals nothing the row does
+not already show.
 
 ---
 
@@ -424,15 +479,16 @@ app/
   api/link/route.js        → POST create a link request (requires a password)
   api/unlink/route.js      → POST verify the password, queue a delete
   api/requests/[publicId]/route.js → GET poll status, action + pairing code
-  api/connected/route.js   → POST resolve connected state + masked numbers
+  api/connected/route.js   → GET every connected session, masked
 components/
   Linker.jsx               → the whole state machine (client)
-  DeviceList.jsx           → the masked "Your numbers" list
+  DeviceList.jsx           → the masked connected-numbers list
 lib/
-  schema.sql               → device_requests + device_credentials DDL (idempotent)
+  schema.sql               → device_requests + device_credentials + bot_sessions
   password.js              → scrypt hashing, verification, strength policy
   credentials.js           → credential store + per-number lockout
-  deviceStore.js           → localStorage of publicIds (never raw numbers)
+  legacyPassword.js        → the primary password for numbers that have none
+  sessions.js              → reading the session register, list keys
   db.js                    → pooled pg client, cached across hot reloads
   phone.js                 → E.164 normalization, display masking
   countries.js             → dial codes for the selector

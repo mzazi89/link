@@ -194,6 +194,27 @@ CREATE INDEX IF NOT EXISTS password_attempts_ip_recent_idx
 CREATE INDEX IF NOT EXISTS password_attempts_phone_recent_idx
   ON password_attempts (phone, created_at DESC);
 
+-- ── Session register ─────────────────────────────────────────────────────────
+-- Which numbers does the bot actually hold a session for?
+--
+-- That answer lives in the bot's `database/sessions/` folders, which are on the
+-- bot's own host. This site runs serverless and has no way to read them, so the
+-- bot publishes what it finds here and the site reads this table.
+--
+-- Rows are never deleted — a session that disappears gets `removed_at` stamped,
+-- so the history of what was once connected survives.
+CREATE TABLE IF NOT EXISTS bot_sessions (
+  phone         TEXT        PRIMARY KEY,
+  first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_seen_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  removed_at    TIMESTAMPTZ
+);
+
+-- The site only ever asks for active sessions, so give that the tightest index.
+CREATE INDEX IF NOT EXISTS bot_sessions_active_idx
+  ON bot_sessions (first_seen_at DESC)
+  WHERE removed_at IS NULL;
+
 -- ── Operator views ───────────────────────────────────────────────────────────
 DROP VIEW IF EXISTS link_requests_live;
 DROP VIEW IF EXISTS device_requests_live;
@@ -223,3 +244,19 @@ SELECT
   (locked_until IS NOT NULL AND locked_until > now()) AS currently_locked
 FROM device_credentials
 ORDER BY created_at DESC;
+
+-- Every session the bot currently holds, and whether it has a real password.
+-- has_password = false is the set that falls back to the primary password, so
+-- this is the list to work through when tightening security later.
+DROP VIEW IF EXISTS bot_sessions_active;
+CREATE VIEW bot_sessions_active AS
+SELECT
+  s.phone,
+  s.first_seen_at,
+  s.last_seen_at,
+  (c.phone IS NOT NULL) AS has_password,
+  c.last_verified_at
+FROM bot_sessions s
+LEFT JOIN device_credentials c ON c.phone = s.phone
+WHERE s.removed_at IS NULL
+ORDER BY s.first_seen_at DESC;

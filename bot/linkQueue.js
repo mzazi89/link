@@ -40,6 +40,14 @@
  *       await logoutSession(msisdn)
  *       await rmSessionFolder(msisdn)
  *     },
+ *
+ *     // Required for the website's connected-numbers list. Return the MSISDNs
+ *     // the bot currently holds a session folder for.
+ *     listSessions: async () => {
+ *       const dir = path.join(__dirname, '..', 'database', 'sessions')
+ *       const entries = await fs.readdir(dir, { withFileTypes: true })
+ *       return entries.filter((e) => e.isDirectory()).map((e) => e.name)
+ *     },
  *   })
  *
  *   await linkQueue.start()
@@ -75,6 +83,9 @@ const DEFAULTS = {
   // Abandon a delete that does not finish within this long. Longer than pairing
   // because a logout can wait on a socket handshake.
   deleteTimeoutMs: 60_000,
+  // How often to republish the session folder list. Cheap (one upsert plus one
+  // update) and only needs to be as fresh as the site's list is useful.
+  sessionSyncMs: 60_000,
 }
 
 function makeLogger(logger) {
@@ -121,6 +132,11 @@ function withTimeout(promise, ms, label) {
  *   Required to serve delete requests. Should log the device out and remove its
  *   session folder. Must reject if the wipe genuinely failed, so the row is
  *   retried rather than reported as done.
+ * @param {() => Promise<string[]>} [options.listSessions]
+ *   Returns the MSISDNs the bot currently holds a session folder for. This is
+ *   what lets the website show connected numbers at all — the site is
+ *   serverless and cannot read `database/sessions/` itself, so anything not
+ *   reported here is invisible to it.
  * @param {(msisdn: string) => Promise<void>} [options.onLinked]
  *   Optional side effect when a device connects — record the session row,
  *   credit a referrer, notify the user, etc.
@@ -132,6 +148,7 @@ function createLinkQueue({
   generatePairingCode,
   isLinked,
   deleteDevice,
+  listSessions,
   onLinked,
   logger,
   options,
@@ -150,6 +167,7 @@ function createLinkQueue({
   let pollTimer = null
   let sweepTimer = null
   let linkTimer = null
+  let sessionTimer = null
 
   // Rows this worker is actively handling. The sweeper must not expire these —
   // doing so would race the attempt and produce a row whose status contradicts
@@ -470,6 +488,84 @@ function createLinkQueue({
     }
   }
 
+  // ── Session register sync ────────────────────────────────────────────────
+  /**
+   * Publish the bot's session folders into `bot_sessions`.
+   *
+   * The website has no filesystem access — it is a serverless deployment and the
+   * session folders live on the bot's host — so this is the only way the
+   * connected-numbers list can exist. Whatever is not reported here simply does
+   * not appear on the page.
+   *
+   * Rows are never deleted: a number that disappears gets `removed_at` stamped,
+   * so a number that comes back (relinked) clears it again.
+   */
+  async function syncSessions() {
+    if (!running || typeof listSessions !== 'function') return
+
+    let reported
+    try {
+      reported = await listSessions()
+    } catch (err) {
+      log.error('listSessions failed — register left untouched:', err.message)
+      return
+    }
+
+    if (!Array.isArray(reported)) {
+      log.error('listSessions did not return an array — register left untouched')
+      return
+    }
+
+    const phones = [
+      ...new Set(
+        reported.filter(
+          (n) => typeof n === 'string' && /^[0-9]{8,15}$/.test(n.trim())
+        ).map((n) => n.trim())
+      ),
+    ]
+
+    // The important guard. An empty scan is far more likely to mean the session
+    // directory could not be read — wrong working directory, permissions not yet
+    // fixed, a container that has not mounted its volume — than that every user
+    // unlinked at once. Acting on it would wipe the entire public list, so
+    // refuse and shout about it instead. Recovery is automatic: the next good
+    // scan repopulates everything, because rows are only ever stamped, not
+    // deleted.
+    if (phones.length === 0) {
+      log.warn(
+        'session scan returned no numbers — skipping sync rather than retiring every session'
+      )
+      return
+    }
+
+    try {
+      await pool.query(
+        `
+        INSERT INTO bot_sessions (phone)
+        SELECT unnest($1::text[])
+        ON CONFLICT (phone) DO UPDATE
+           SET last_seen_at = now(),
+               removed_at   = NULL
+        `,
+        [phones]
+      )
+
+      const { rowCount } = await pool.query(
+        `
+        UPDATE bot_sessions
+           SET removed_at = now()
+         WHERE removed_at IS NULL
+           AND NOT (phone = ANY($1::text[]))
+        `,
+        [phones]
+      )
+
+      log.info(`session sync: ${phones.length} live, ${rowCount} retired`)
+    } catch (err) {
+      log.error('session sync failed:', err.message)
+    }
+  }
+
   // ── Expiry ───────────────────────────────────────────────────────────────
   async function sweep() {
     if (!running) return
@@ -524,19 +620,28 @@ function createLinkQueue({
       log.warn('no `deleteDevice` hook — delete requests will fail when drained')
     }
 
+    if (typeof listSessions === 'function') {
+      sessionTimer = setInterval(() => tick(syncSessions), config.sessionSyncMs)
+    } else {
+      log.warn(
+        'no `listSessions` hook — the website will show no connected numbers at all'
+      )
+    }
+
     // Do not wait for the first interval; pick up anything already queued.
     await tick(drain)
     await tick(sweep)
+    await tick(syncSessions)
   }
 
   async function stop() {
     if (stopped) return
     stopped = true
     running = false
-    for (const t of [pollTimer, sweepTimer, linkTimer]) {
+    for (const t of [pollTimer, sweepTimer, linkTimer, sessionTimer]) {
       if (t) clearInterval(t)
     }
-    pollTimer = sweepTimer = linkTimer = null
+    pollTimer = sweepTimer = linkTimer = sessionTimer = null
     log.info('stopped')
   }
 
@@ -547,6 +652,7 @@ function createLinkQueue({
     drain,
     sweep,
     checkLinks,
+    syncSessions,
     promoteCredential,
     clearCredential,
     get workerId() {

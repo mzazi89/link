@@ -1,17 +1,14 @@
 'use client'
 
 /**
- * The numbers this browser has linked, shown masked.
+ * The numbers the bot is currently connected to.
  *
- * Numbers are masked by the server (see maskForDisplay), so nothing here ever
- * holds or renders a full phone number. This component is presentational — it
- * receives already-masked values.
+ * Every value here is masked by the server (`maskForDisplay`), so this component
+ * never holds or renders a full phone number — it only lays out what it is
+ * given.
  */
-export default function DeviceList({ devices, loading, error, onRemove, onRefresh }) {
-  // Nothing linked yet: stay out of the way rather than showing an empty shell.
-  if (!loading && !error && devices.length === 0) return null
-
-  const connected = devices.filter((d) => d.connected).length
+export default function DeviceList({ devices, loading, error, onRefresh }) {
+  const count = devices.length
 
   return (
     // Sits inside the Linker card, separated by a hairline rather than given its
@@ -19,11 +16,21 @@ export default function DeviceList({ devices, loading, error, onRemove, onRefres
     <section className="border-t hairline" aria-labelledby="connected-heading">
       <div className="flex items-center justify-between gap-3 border-b px-5 py-3.5 hairline">
         <span className="label" id="connected-heading">
-          Your numbers
+          Connected numbers
         </span>
-        <span className="label">
-          {loading ? 'Checking' : `${connected} connected`}
-        </span>
+        <div className="flex items-center gap-3">
+          <span className="label">
+            {loading ? 'Checking' : `${count} ${count === 1 ? 'number' : 'numbers'}`}
+          </span>
+          <button
+            type="button"
+            onClick={onRefresh}
+            disabled={loading}
+            className="font-mono text-[10px] uppercase tracking-label text-paper-faint hover:text-amber disabled:opacity-40"
+          >
+            Refresh
+          </button>
+        </div>
       </div>
 
       {error ? (
@@ -35,45 +42,40 @@ export default function DeviceList({ devices, loading, error, onRemove, onRefres
         </div>
       ) : null}
 
-      {!error && devices.length > 0 ? (
+      {!error && count > 0 ? (
         <ul>
           {devices.map((device) => (
             <li
-              key={device.publicId}
-              className="flex items-center justify-between gap-4 border-b px-5 py-4 last:border-b-0 hairline"
+              key={device.id}
+              className="flex items-center justify-between gap-4 border-b px-5 py-3.5 last:border-b-0 hairline"
             >
-              <div className="min-w-0">
-                <p
-                  className={`truncate font-mono text-[14px] tracking-wide ${
-                    device.connected ? 'text-paper' : 'text-paper-faint'
-                  }`}
-                >
-                  {device.maskedPhone || '—'}
-                </p>
-                <p className="mt-1 font-mono text-[10px] uppercase tracking-label text-paper-faint">
-                  {device.connected ? 'Connected' : 'Not connected'}
-                </p>
-              </div>
-
-              {device.connected ? (
-                <button
-                  type="button"
-                  onClick={() => onRemove(device.publicId)}
-                  className="btn-ghost shrink-0"
-                >
-                  Remove
-                </button>
-              ) : null}
+              <p className="truncate font-mono text-[14px] tracking-wide text-paper">
+                {device.maskedPhone}
+              </p>
+              <span className="flex shrink-0 items-center gap-2">
+                <span
+                  className="h-1.5 w-1.5 rounded-full bg-amber"
+                  aria-hidden="true"
+                />
+                <span className="font-mono text-[10px] uppercase tracking-label text-paper-faint">
+                  Live
+                </span>
+              </span>
             </li>
           ))}
         </ul>
       ) : null}
 
+      {!error && !loading && count === 0 ? (
+        <p className="px-5 py-4 text-[12.5px] leading-relaxed text-paper-muted">
+          No numbers are connected to the bot right now.
+        </p>
+      ) : null}
+
       <div className="border-t px-5 py-3 hairline">
         <p className="text-[11.5px] leading-relaxed text-paper-faint">
-          Only the numbers linked from this browser are listed, and they are shown
-          with the middle digits hidden. Another browser, or another person, sees
-          nothing here.
+          Numbers currently paired with the bot, with the middle digits hidden.
+          Removing one requires the password set when it was linked.
         </p>
       </div>
     </section>

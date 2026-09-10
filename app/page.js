@@ -37,8 +37,8 @@ const NOTES = [
     body: 'Link the number again from the phone and you can set a new one. Whoever holds the phone can always re-establish control, which is exactly why the password is set at link time rather than beforehand.',
   },
   {
-    title: 'Your number is not shown publicly',
-    body: 'Requests are queued against a random reference and we store only a salted hash of the network address you came from. You can close this page at any time.',
+    title: 'Connected numbers are listed, partly hidden',
+    body: 'Every number paired with the bot is listed on this page with its middle digits masked, so a full number is never shown. Requests are queued against a random reference, and only a salted hash of the network address you came from is stored.',
   },
 ]
 

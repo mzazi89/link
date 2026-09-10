@@ -1,120 +1,67 @@
 import { NextResponse } from 'next/server'
 
-import { query } from '@/lib/db'
 import { maskForDisplay } from '@/lib/phone'
+import { listActiveSessions, sessionKey } from '@/lib/sessions'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 
 const NO_STORE = { 'Cache-Control': 'no-store' }
 
-// The browser only ever holds a handful of these, so a generous ceiling costs
-// nothing and bounds the query's parameter array.
-const MAX_IDS = 50
-
 /**
- * Resolve the connected state of specific numbers.
+ * The numbers the bot is currently connected to.
  *
- * Body: { publicIds: ["...", "..."] }
+ * This list is derived from the bot's session folders, published into
+ * `bot_sessions` by the worker's sync job — the site itself is serverless and
+ * cannot read that directory. Whatever the bot fails to report does not appear.
  *
- * ── Why this takes publicIds and not phone numbers ───────────────────────────
+ * ── This is a PUBLIC list ────────────────────────────────────────────────────
  *
- * Taking a list of numbers would make this an enumeration oracle: anyone could
- * post a range of numbers and learn which of them are customers. That is exactly
- * the leak the rest of the design works to avoid.
+ * There is no login and this takes no parameters, so anyone who opens the page
+ * sees every connected number. The only protection is the masking: the middle
+ * digits are never sent, so a visitor sees `254741****86` and not the number
+ * itself.
  *
- * A public_id is 24 random base64url characters, so a caller can only ask about
- * numbers it already holds a reference for — the ones this browser linked. The
- * response is therefore limited to what the caller already had a right to see.
+ * That is a real exposure and worth being explicit about. A visitor can see how
+ * many customers there are, watch the number grow, and — because the mask keeps
+ * six leading and two trailing digits — narrow any specific entry substantially.
+ * If that is not acceptable, this endpoint is the one to gate.
  *
- * ── What "connected" means ───────────────────────────────────────────────────
- *
- * A device_credentials row existing for the number. That table is written only
- * after a device genuinely links, and the worker removes the row when a device
- * is deleted — so it is a real register of what is currently connected, not a
- * guess from request history.
- *
- * It does NOT know about a device unlinked directly inside WhatsApp. Nothing on
- * this side can see that, because the session folders live on the bot's host.
+ * `has_password` from the register is deliberately NOT included. Publishing
+ * which numbers still rely on the primary password would be publishing a list of
+ * exactly which devices can be removed with a well-known default.
  */
-export async function POST(request) {
-  let body
+export async function GET() {
   try {
-    body = await request.json()
-  } catch {
+    const rows = await listActiveSessions()
+
+    const devices = rows.map((row) => ({
+      id: sessionKey(row.phone),
+      maskedPhone: maskForDisplay(row.phone),
+      connected: true,
+      connectedSince: row.first_seen_at,
+    }))
+
     return NextResponse.json(
-      { ok: false, error: 'bad_request', message: 'Expected a JSON body.' },
-      { status: 400, headers: NO_STORE }
+      { ok: true, count: devices.length, devices },
+      { headers: NO_STORE }
     )
-  }
-
-  const raw = Array.isArray(body?.publicIds) ? body.publicIds : []
-  const publicIds = [
-    ...new Set(
-      raw.filter(
-        (v) => typeof v === 'string' && v.length >= 16 && v.length <= 128
-      )
-    ),
-  ].slice(0, MAX_IDS)
-
-  if (publicIds.length === 0) {
-    return NextResponse.json({ ok: true, devices: [] }, { headers: NO_STORE })
-  }
-
-  try {
-    // DISTINCT ON keeps one row per phone — the newest request for it — so a
-    // number linked several times over the months appears once, not N times.
-    const { rows } = await query(
-      `
-      SELECT DISTINCT ON (r.phone)
-             r.public_id,
-             r.phone,
-             r.action,
-             r.status,
-             r.created_at,
-             r.linked_at,
-             (c.phone IS NOT NULL) AS has_credential,
-             c.created_at          AS credential_since
-        FROM device_requests r
-        LEFT JOIN device_credentials c ON c.phone = r.phone
-       WHERE r.public_id = ANY($1::text[])
-       ORDER BY r.phone, r.created_at DESC
-      `,
-      [publicIds]
-    )
-
-    const devices = rows
-      .map((row) => ({
-        publicId: row.public_id,
-        action: row.action,
-        status: row.status,
-        // Only the masked form leaves the server. The browser that linked a
-        // number never needs the full digits again — removal is authorised by
-        // the password, not by holding the number.
-        maskedPhone: maskForDisplay(row.phone),
-        connected: Boolean(row.has_credential),
-        linkedAt: row.linked_at,
-        connectedSince: row.credential_since,
-      }))
-      // Connected first, newest link first, so the list reads as a live register.
-      .sort((a, b) => {
-        if (a.connected !== b.connected) return a.connected ? -1 : 1
-        return new Date(b.connectedSince || b.linkedAt || 0) - new Date(a.connectedSince || a.linkedAt || 0)
-      })
-
-    return NextResponse.json({ ok: true, devices }, { headers: NO_STORE })
   } catch (err) {
     console.error('[link][connected] lookup failed:', err.message)
     return NextResponse.json(
-      { ok: false, error: 'unavailable', message: 'Could not load your numbers.' },
+      { ok: false, error: 'unavailable', message: 'Could not load connected numbers.' },
       { status: 503, headers: NO_STORE }
     )
   }
 }
 
-export async function GET() {
+export async function POST() {
   return NextResponse.json(
-    { ok: false, error: 'method_not_allowed', message: 'Use POST with a list of references.' },
-    { status: 405, headers: { ...NO_STORE, Allow: 'POST' } }
+    {
+      ok: false,
+      error: 'method_not_allowed',
+      message: 'Use GET. This list takes no parameters.',
+    },
+    { status: 405, headers: { ...NO_STORE, Allow: 'GET' } }
   )
 }
