@@ -26,8 +26,8 @@ function formatLastSeen(iso) {
   return `${Math.floor(hours / 24)}d ago`
 }
 
-function DeviceCard({ device, onRemove }) {
-  const { maskedPhone, online, battery, plugged, lastSeen } = device
+function DeviceCard({ device, onRemove, showBot }) {
+  const { maskedPhone, botName, online, battery, plugged, lastSeen } = device
 
   // Only the telemetry that exists. The current Baileys build does not report
   // battery or charging, and a row of three metrics where two read "—" makes the
@@ -49,6 +49,15 @@ function DeviceCard({ device, onRemove }) {
         </span>
       </div>
 
+      {/* Which bot holds this number. Only worth a row when there is more than
+          one to tell apart. */}
+      {showBot && botName ? (
+        <div className="device-bot">
+          <span className="k">Bot</span>
+          <span className="v">{botName}</span>
+        </div>
+      ) : null}
+
       {stats.length > 0 ? (
         <div className={`metrics cols-${Math.min(stats.length, 3)}`}>
           {stats.map(([key, value]) => (
@@ -69,8 +78,18 @@ function DeviceCard({ device, onRemove }) {
   )
 }
 
-export default function DeviceList({ devices, loading, error, ip, onRefresh, onRemove }) {
+export default function DeviceList({
+  devices,
+  loading,
+  error,
+  bots = [],
+  bot,
+  onBotChange,
+  onRefresh,
+  onRemove,
+}) {
   const count = devices.length
+  const multipleBots = bots.length > 1
 
   return (
     <section className="card">
@@ -78,9 +97,41 @@ export default function DeviceList({ devices, loading, error, ip, onRefresh, onR
         <h2>Connected</h2>
         <span className="mono">
           {count} device{count === 1 ? '' : 's'}
-          {ip ? ` · ${ip}` : ''}
         </span>
       </div>
+
+      {/* Same choice as the pairing form, over the list instead. "All bots" is
+          the default so the view is complete rather than showing whichever bot
+          happened to write its heartbeat last. */}
+      {multipleBots ? (
+        <div className="mode-switch bot-switch" role="tablist" aria-label="Filter by bot">
+          <button
+            type="button"
+            role="tab"
+            className="mode-tab"
+            aria-selected={!bot}
+            onClick={() => onBotChange(null)}
+          >
+            All bots
+          </button>
+          {bots.map((b) => (
+            <button
+              key={b.id}
+              type="button"
+              role="tab"
+              className="mode-tab"
+              aria-selected={bot === b.id}
+              onClick={() => onBotChange(b.id)}
+            >
+              {b.name}
+              <span
+                className={`dot ${b.online ? 'online' : 'offline'}`}
+                style={{ marginLeft: 8 }}
+              />
+            </button>
+          ))}
+        </div>
+      ) : null}
 
       {error ? (
         <div>
@@ -100,7 +151,12 @@ export default function DeviceList({ devices, loading, error, ip, onRefresh, onR
       ) : (
         <div className="device-grid">
           {devices.map((device) => (
-            <DeviceCard key={device.id} device={device} onRemove={onRemove} />
+            <DeviceCard
+              key={device.id}
+              device={device}
+              showBot={multipleBots}
+              onRemove={() => onRemove(device)}
+            />
           ))}
         </div>
       )}

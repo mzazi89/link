@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 
 import { createPairRequest, findInFlight } from '@/lib/botControl'
 import { isBotOnline } from '@/lib/botStatus'
+import { listBots } from '@/lib/bots'
 import { notifyRequest, unavailable } from '@/lib/db'
 import { hashPassword, validatePasswordStrength } from '@/lib/password'
 import { describeReason, formatE164, maskForDisplay, normalizePhone } from '@/lib/phone'
@@ -86,15 +87,29 @@ export async function POST(request) {
   }
 
   try {
-    // A code is produced by the bot. Queueing one while it is offline just parks
-    // the user in front of a spinner, so say so instead.
-    if (!(await isBotOnline())) {
+    // Which bot this is for. An unknown name is refused rather than quietly
+    // falling back to the primary one, because a pairing that lands on the wrong
+    // bot looks successful and cannot be undone from the website.
+    const bots = await listBots()
+    const requested = typeof body?.bot === 'string' ? body.bot.trim() : ''
+    const bot = requested ? bots.find((b) => b.id === requested) : bots[0]
+
+    if (!bot) {
+      return NextResponse.json(
+        { ok: false, error: 'unknown_bot', message: 'That bot is not available.' },
+        { status: 400, headers: NO_STORE }
+      )
+    }
+
+    // A code is produced by the chosen bot. Queueing one while THAT bot is
+    // offline parks the user in front of a spinner for nothing — checking some
+    // other bot's health would be worse than not checking at all.
+    if (!(await isBotOnline(bot.id))) {
       return NextResponse.json(
         {
           ok: false,
           error: 'bot_offline',
-          message:
-            'The bot is offline, so it cannot generate a pairing code right now. Try again shortly.',
+          message: `${bot.name} is offline, so it cannot generate a pairing code right now. Try again shortly.`,
         },
         { status: 503, headers: NO_STORE }
       )
@@ -117,7 +132,7 @@ export async function POST(request) {
 
     // Last, because it is the only expensive step and every check above is cheap.
     const passwordHash = await hashPassword(body.password)
-    const created = await createPairRequest(phone, passwordHash)
+    const created = await createPairRequest(phone, passwordHash, bot.id)
 
     // OPTIONAL SPEED PATH. The bot finds this on its own poll (quartzxd's README
     // puts that at ~15s), so this notification does nothing on its own — quartz
@@ -136,6 +151,8 @@ export async function POST(request) {
         ok: true,
         requestId: created.id,
         action: 'pair',
+        bot: bot.id,
+        botName: bot.name,
         phone: formatE164(phone),
         maskedPhone: maskForDisplay(phone),
         createdAt: created.created_at,

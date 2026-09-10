@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 
 import { createUnpairRequest, findInFlight, promoteCredential } from '@/lib/botControl'
 import { isKnownSession } from '@/lib/botStatus'
+import { listBots } from '@/lib/bots'
 import {
   clearFailedAttempts,
   loadCredential,
@@ -167,8 +168,18 @@ export async function POST(request) {
       )
     }
 
+    // Unlike pairing, a removal may legitimately leave the bot unsaid: a number
+    // is held by exactly one bot, and "any bot" lets whichever one has it act.
+    // A name that was given but is not real is still refused, so a stale
+    // selector cannot silently become an untargeted request.
+    const bots = await listBots()
+    const requested = typeof body?.bot === 'string' ? body.bot.trim() : ''
+    if (requested && !bots.some((b) => b.id === requested)) {
+      return json({ ok: false, error: 'unknown_bot', message: 'That bot is not available.' }, 400)
+    }
+
     await recordRequest({ action: 'unpair', phone, ipHash })
-    const created = await createUnpairRequest(phone)
+    const created = await createUnpairRequest(phone, requested)
 
     // Same optional speed path as pairing — see the note in /api/link.
     notifyRequest(String(created.id))

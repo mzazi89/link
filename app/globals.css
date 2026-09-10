@@ -968,3 +968,50 @@ h2 { font-size: 16px; letter-spacing: 0; }
    fill a third of the width. */
 .metrics.cols-1 .metric { display: flex; align-items: baseline; gap: 8px; }
 .metrics.cols-1 .metric .k { display: inline; }
+
+/* ─── Bot selection ────────────────────────────────────────────────────────── */
+/* Reuses the mode switch wholesale — it is the same kind of control, so it
+   should not look like a different one. Only two differences: it wraps, because
+   bot names are longer than "Link"/"Remove", and it sits in the form flow rather
+   than at the top of a card. */
+.bot-switch {
+  flex-wrap: wrap;
+  width: 100%;
+  margin-bottom: 0;
+}
+
+.bot-switch .mode-tab {
+  display: inline-flex;
+  align-items: center;
+  flex: 1 1 auto;
+  justify-content: center;
+  min-width: 0;
+}
+
+.card > .bot-switch {
+  margin-bottom: 16px;
+}
+
+/* Which bot holds a device. A quiet label/value row, matching the metrics
+   below it rather than shouting over them. */
+.device-bot {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-top: 10px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+
+.device-bot .k {
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+
+.device-bot .v { color: var(--amber); }
+
+@media (max-width: 640px) {
+  /* Two-column bot names would be unreadable at this width. */
+  .bot-switch .mode-tab { flex: 1 1 100%; }
+}

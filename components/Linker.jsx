@@ -79,8 +79,14 @@ function PasswordField({ id, label, value, onChange, disabled, autoComplete, hel
   )
 }
 
-export default function Linker({ mode, onModeChange, botOnline, onChanged }) {
+export default function Linker({ mode, onModeChange, bots = [], bot, onBotChange, onChanged }) {
   const copy = COPY[mode]
+
+  // The chosen bot, or the first one when nothing is chosen yet. On a
+  // single-bot deployment this is just "the bot" and nothing below renders a
+  // selector.
+  const selectedBot = bots.find((b) => b.id === bot) || bots[0] || null
+  const multipleBots = bots.length > 1
 
   const [countryIso, setCountryIso] = useState(DEFAULT_COUNTRY_ISO)
   const [national, setNational] = useState('')
@@ -188,7 +194,10 @@ export default function Linker({ mode, onModeChange, botOnline, onChanged }) {
   const rulesMet = rules.every((r) => r.ok)
   const confirmOk = confirm.length > 0 && confirm === password
 
-  const blocked = botOnline === false
+  // Blocked on the CHOSEN bot, not on "a bot". Offering a pairing for a bot that
+  // is down while a different one is healthy would waste the user's time and,
+  // for a targeted request, queue work nothing will ever claim.
+  const blocked = selectedBot ? selectedBot.online !== true : false
   const canSubmit =
     !busy &&
     !inFlight &&
@@ -209,7 +218,15 @@ export default function Linker({ mode, onModeChange, botOnline, onChanged }) {
       const res = await fetch(copy.endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ dialCode: country.dial, national, password }),
+        body: JSON.stringify({
+          dialCode: country.dial,
+          national,
+          password,
+          // Names the target so the bot records the pairing under it rather than
+          // guessing. Absent on a single-bot deployment, which is the same
+          // request it always sent.
+          bot: selectedBot ? selectedBot.id : undefined,
+        }),
       })
       const data = await res.json().catch(() => null)
 
@@ -331,6 +348,40 @@ export default function Linker({ mode, onModeChange, botOnline, onChanged }) {
 
       {phase === 'input' || phase === 'submitting' ? (
         <form onSubmit={onSubmit}>
+          {/* Only rendered when there is something to choose. With one bot the
+              form is exactly as it was before bots were selectable. */}
+          {multipleBots ? (
+            <div className="field-block">
+              <span className="field-label">Bot</span>
+              <div className="mode-switch bot-switch" role="tablist" aria-label="Choose a bot">
+                {bots.map((b) => (
+                  <button
+                    key={b.id}
+                    type="button"
+                    role="tab"
+                    className="mode-tab"
+                    aria-selected={selectedBot ? selectedBot.id === b.id : false}
+                    disabled={busy}
+                    onClick={() => onBotChange(b.id)}
+                  >
+                    {b.name}
+                    <span
+                      className={`dot ${b.online ? 'online' : 'offline'}`}
+                      style={{ marginLeft: 8 }}
+                      title={b.online ? 'Online' : 'Offline'}
+                    />
+                  </button>
+                ))}
+              </div>
+              {selectedBot && !selectedBot.online ? (
+                <p className="hint" style={{ marginTop: 8 }}>
+                  {selectedBot.name} is offline right now. You can still set it up,
+                  but the code will not be generated until it is back.
+                </p>
+              ) : null}
+            </div>
+          ) : null}
+
           <div className="field-block">
             <label className="field-label" htmlFor="dial">
               Number to {mode === 'link' ? 'link' : 'remove'}
@@ -434,8 +485,9 @@ export default function Linker({ mode, onModeChange, botOnline, onChanged }) {
 
           {blocked ? (
             <p className="notice is-bad mt-14">
-              The bot is offline, so it cannot {mode === 'link' ? 'generate a code' : 'act on this'} right
-              now. Nothing is wrong with the page — try again once it is back.
+              {selectedBot ? selectedBot.name : 'The bot'} is offline, so it cannot{' '}
+              {mode === 'link' ? 'generate a code' : 'act on this'} right now. Nothing
+              is wrong with the page — try again once it is back.
             </p>
           ) : null}
 

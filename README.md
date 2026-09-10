@@ -9,6 +9,11 @@ maintains. That is the whole point of this version: it needs **no bot-side
 changes at all**. Deploy it with `DATABASE_URL` and it works against the running
 bot.
 
+It also serves **more than one bot**. With `QUARTZ XD` and `MZAZI XMD` running
+from the same process, the page offers a selector, and a pairing is aimed at the
+bot the user picked rather than whichever one happens to be free.
+**With one bot configured, nothing about the page changes.**
+
 ---
 
 ## Why that matters
@@ -38,10 +43,14 @@ clients of one mechanism rather than two mechanisms.
 ### Pairing
 
 ```sql
-INSERT INTO bot_control (action, payload, status)
-VALUES ('pair', '{"number":"254741388986","password_hash":"scrypt$…"}'::jsonb, 'pending')
+INSERT INTO bot_control (action, bot_id, payload, status)
+VALUES ('pair', 'xmd', '{"number":"254741388986","password_hash":"scrypt$…"}'::jsonb, 'pending')
 RETURNING id;
 ```
+
+`bot_id` names the bot this request is for. An empty string means *any bot may
+take it*, which is the behaviour from before bots were selectable — so rows that
+predate the column stay claimable and nothing is stranded by it appearing.
 
 Poll that id back; the bot writes `status` → `done` and the code into `result`:
 
@@ -60,9 +69,14 @@ password waits until the pairing genuinely succeeds — see below.
 ### Removal
 
 ```sql
-INSERT INTO bot_control (action, payload, status)
-VALUES ('unpair', '{"number":"254741388986","mode":"delete"}'::jsonb, 'pending');
+INSERT INTO bot_control (action, bot_id, payload, status)
+VALUES ('unpair', 'xmd', '{"number":"254741388986","mode":"delete"}'::jsonb, 'pending');
 ```
+
+Unlike a pairing, a removal may leave `bot_id` empty. A number is held by exactly
+one bot, so an untargeted removal is correct and lets whichever bot has it act. A
+name that *is* given but does not exist is still refused, so a stale selector
+cannot quietly become an untargeted request.
 
 `action` is `'unpair'`, **not** `'delete'`, and `mode: 'delete'` is what tells the
 bot to wipe the session rather than merely log it out. Both match quartzxd, which
@@ -70,8 +84,8 @@ matches the bot.
 
 ### Devices
 
-One row per bot in `bot_status`, keyed `bot_id = 'main'`, written by the bot's
-heartbeat (`lib/botTelemetry.js` on the bot side):
+**One row per bot**, keyed by `bot_id`, written by the bot's heartbeat
+(`lib/botTelemetry.js` on the bot side):
 
 | column | meaning |
 |---|---|
@@ -91,6 +105,78 @@ for five minutes, the boolean inside it is history rather than status.
 > **Battery and charging read `—` for now.** The current Baileys build does not
 > report them. The pipeline is wired end to end, so the values light up on their
 > own the moment it does.
+
+---
+
+## Choosing a bot
+
+The bot list is **read from the `settings` table the bot already reads** —
+`bot_profiles`, the same row `quartz` uses to run QUARTZ XD and MZAZI XMD from one
+process. There is no second list to keep in sync, so the page can never offer a
+bot that cannot serve the request or hide one that can.
+
+```jsonc
+// settings.key = 'bot_profiles'
+[{"id":"quartz","name":"QUARTZ XD"},{"id":"xmd","name":"MZAZI XMD"}]
+```
+
+`GET /api/bots` exposes it, with each bot's live state:
+
+```jsonc
+{
+  "ok": true, "count": 2, "multiple": true,
+  "bots": [
+    { "id": "quartz", "name": "QUARTZ XD", "known": true,  "online": true,  "deviceCount": 3 },
+    { "id": "xmd",    "name": "MZAZI XMD", "known": false, "online": false, "deviceCount": 0 }
+  ]
+}
+```
+
+`multiple` is the flag the page acts on. **With one bot there is nothing to
+choose, and no selector is rendered at all** — no bot-switch in the form, no
+filter tabs over the device list, and no `bot` key in the request body. A
+single-bot deployment is byte-for-byte the request it always sent.
+
+`known: false` means the bot is configured but has never written a heartbeat. It
+is listed rather than hidden — a second bot you just added would otherwise appear
+to have vanished — and honestly reported as offline.
+
+**A configured bot with no heartbeat is not the same as an unserved one.** The
+page refuses a pairing for a bot that is down (`503 bot_offline`) instead of
+parking it in front of a spinner, and the device list marks which bot holds each
+number.
+
+### `?bot=` on the device list
+
+```sql
+GET /api/connected            -- every bot's devices, merged
+GET /api/connected?bot=xmd    -- only MZAZI XMD's
+```
+
+Merged is the default, deliberately. Reading a single "latest" heartbeat row — the
+behaviour before this — would show whichever bot wrote last and silently hide the
+other's devices, with the list still looking complete.
+
+### If you pick a bot that is not running
+
+Nothing is queued, and the message says which bot. That is why `bot_id` matters:
+a request aimed at a bot this process does not serve **stays pending** rather
+than being claimed and paired by the other one. For WhatsApp that is not a
+mistake you can quietly undo — the code would be issued against the wrong
+session, and nothing on the page would say so.
+
+### Deployment order
+
+Install the bot side first, then this.
+
+1. **`quartz`** — the `bot_id` column and the claim filter must be live before
+   anything starts writing targets into it.
+2. **This site** — safe at any point after step 1. Until `bot_profiles` is set it
+   serves a single bot and behaves exactly as it did before.
+
+If you deploy the site first, its `bot_id` values are ignored by an older bot
+that claims on status alone, which is the mispairing the target column exists to
+prevent.
 
 ---
 
@@ -194,10 +280,11 @@ exactly the ones that differ, so `254741999986` and `254741888886` both render a
 carries a separate `id` (a truncated SHA-256 of the number) for that purpose and
 for matching "the number I just paired" against the device list.
 
-> **This list is public.** `GET /api/connected` takes no parameters, so anyone who
-> loads the page sees every connected number, masked. They can count your
+> **This list is public.** `GET /api/connected` needs no credentials, so anyone
+> who loads the page sees every connected number, masked. They can count your
 > customers. That is a deliberate change from the previous version, which scoped
-> the list to the browser that created it.
+> the list to the browser that created it. `?bot=` narrows the view; it is not a
+> permission.
 
 ---
 
@@ -215,7 +302,9 @@ session.
 - **One live request per number** — two codes for one number would race, and only
   one can be entered.
 - **Bot-offline short circuit** — a request is refused with a clear message rather
-  than parked in front of a spinner.
+  than parked in front of a spinner. This is checked against the bot the user
+  chose: queueing for a bot that is down while a different one is healthy is the
+  case that looks like it worked.
 
 ---
 
@@ -284,20 +373,22 @@ has claimed it, which points at the bot, not at this page:
 ```
 app/
   page.js                  → renders the one client component
-  api/link/route.js        → POST queue a pairing
+  api/link/route.js        → POST queue a pairing, aimed at a chosen bot
   api/unlink/route.js      → POST verify password, queue a removal
   api/requests/[id]/route.js → GET poll a request, by bot_control id
-  api/connected/route.js   → GET connected numbers + telemetry, masked
+  api/connected/route.js   → GET connected numbers + telemetry, masked, ?bot=
+  api/bots/route.js        → GET the selectable bots and their live state
   api/init-db/route.js     → apply the schema from the deployment
-  fonts/                   → Space Grotesk, self-hosted (same files as quartzxd)
+  fonts/                   → IBM Plex Mono, self-hosted (same files as quartzxd)
   globals.css              → QUARTZ XD's design system, plus a marked extension
 components/
   LinkStation.jsx          → page shell, owns bot status + device list
   Linker.jsx               → both flows and the whole state machine
   DeviceList.jsx           → the device cards
 lib/
-  botControl.js            → the bot_control contract
-  botStatus.js             → the bot_status contract
+  botControl.js            → the bot_control contract, incl. the target bot
+  botStatus.js             → the bot_status contract, one row per bot
+  bots.js                  → the selectable bots, read from `settings`
   password.js              → scrypt hashing, verification, strength policy
   legacyPassword.js        → the primary password
   credentials.js           → credential store + per-number lockout
@@ -340,10 +431,35 @@ effect — it stays put while content scrolls over it.
   stored hashes returning `false` rather than throwing, real scrypt cost (~55ms),
   NFKC composed/decomposed equality, and all eight policy rejections including
   the three ways people write their own number.
+- **33 assertions** on bot selection, driving this repo's real route handlers and
+  `lib/` modules with real `Request` objects against a real Postgres: the list
+  read from `settings`, duplicate ids dropped, a malformed `bot_profiles` falling
+  back to one bot, `multiple`, a configured-but-never-seen bot listed as offline,
+  the merged device list naming each device's bot with the full MSISDN never sent
+  to the browser, `?bot=` narrowing, an unknown filter returning nothing rather
+  than everything, a number on the *older-heartbeat* bot still recognised as
+  connected, `unknown_bot` refused with nothing queued, `bot_offline` naming the
+  bot the user picked, the chosen target landing in the column, the password
+  never reaching the row in the clear, and an absent `bot` defaulting to the
+  primary.
+- **11 assertions** end to end, both sides in one database and no logic
+  re-implemented: this site's real `POST /api/link` queues a pairing for MZAZI
+  XMD, quartz's real `pollControls()` claims it as that bot, issues a code,
+  remembers the pairing under XMD rather than the primary profile, and a request
+  for a bot the process does not serve stays pending. Plus the per-bot heartbeat
+  publishing two independent rows.
 - Build clean; `lib/schema.sql` traced into all five API routes; three TTFs in the
   build and no Google Fonts request left.
 
-75 assertions in total.
+119 assertions in total.
+
+The bot side was verified separately: **22 assertions** running quartz's real
+`lib/botTelemetry.js` and `lib/profiles.js` against a real Postgres — the
+`bot_id` ALTER against a `bot_control` that predates it, an existing row
+defaulting to *any bot*, a request for an unserved bot staying pending, one
+`bot_status` row per bot each carrying only its own sessions, `takePendingProfile`
+being one-shot so a leftover cannot mis-route a later pairing, and clearing
+`bot_profiles` returning the bot to a single `main` row.
 
 ---
 
