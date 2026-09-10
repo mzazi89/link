@@ -201,7 +201,12 @@ pairing path is genuinely concurrent.
 It copies the `password_hash` staged on the request into `device_credentials`
 and then nulls it on the request. If you write your own worker instead of using
 this module, that promotion is the part to replicate — skip it and every number
-will link fine and then be impossible to remove.
+will link fine, be impossible to remove, **and never appear in the connected
+list**, because that table is also the register the site reads.
+
+Its counterpart is `clearCredential`, called on the delete path after the
+session is wiped. Both halves are needed: promotion without clearing leaves
+removed devices showing as connected forever.
 
 It is also guarded so an old request cannot clobber a newer credential:
 
@@ -284,6 +289,73 @@ really the per-number lockout, so the two cannot be told apart from outside.
 
 ---
 
+## Connected numbers
+
+The page shows the numbers this browser has linked, with the middle digits
+hidden:
+
+```
+254741388986  →  254741****86
+```
+
+### Why it is scoped to the browser
+
+There is no login, so the server has no idea who "you" are. Two options existed:
+list every number connected to the bot, or list only the ones this browser
+linked. The second was chosen — a public list would expose your whole customer
+base to anyone who opens the page, and let a competitor watch it grow.
+
+The browser keeps only the opaque `public_id` of each link request it created,
+in `localStorage`. Those references are sent to `POST /api/connected`, which
+resolves them and returns the masked number and whether it is still connected.
+**A raw phone number is never stored in the browser and never returned by that
+endpoint.**
+
+Taking `public_id`s rather than phone numbers is deliberate: an endpoint that
+accepted numbers would be an enumeration oracle — post a range and learn which
+ones are customers. A `public_id` is 24 random characters, so a caller can only
+ask about numbers it already holds a reference to.
+
+### What "connected" means
+
+The existence of a `device_credentials` row. That table is written only after a
+device genuinely links, and the worker deletes the row when a device is removed,
+so it is a real register rather than a guess from request history.
+
+Two ordering details make it trustworthy:
+
+- The worker **promotes the credential before** flipping the request to
+  `linked`, so a browser polling in that window can never see a freshly linked
+  number reported as not connected.
+- The worker **clears the credential before** marking a delete `completed`, so a
+  removed number drops off the list immediately — including when it was removed
+  from a *different* browser, because the check is server-side.
+
+### Masking tiers
+
+A fixed "first six" is reasonable on a 12-digit Kenyan number and far too
+generous on an 8-digit one, so the reveal shrinks with the number:
+
+| Length | Keeps | Example |
+|---|---|---|
+| 11+ | first 6, last 2 | `254741388986` → `254741****86` |
+| 9–10 | first 4, last 2 | `447911123456` → `447911****56` |
+| 7–8 | first 3, last 2 | `12345678` → `123***78` |
+| ≤ 6 | first 1, last 1 | `123456` → `1****6` |
+
+Every result hides at least one digit and preserves the length, so the shape of
+the number is still recognisable to its owner.
+
+### The limitation
+
+A number unlinked **directly inside WhatsApp** still reads as connected here.
+Nothing on this side can see that — the session folders live on the bot's host,
+and only `isLinked` knows. If you want those reconciled, have the worker's
+`checkLinks` loop also sweep `linked` rows whose `isLinked()` now returns false
+and clear their credential.
+
+---
+
 ## Abuse controls — read this before going public
 
 Removing login removes the only thing that used to limit who could create a
@@ -352,14 +424,17 @@ app/
   api/link/route.js        → POST create a link request (requires a password)
   api/unlink/route.js      → POST verify the password, queue a delete
   api/requests/[publicId]/route.js → GET poll status, action + pairing code
+  api/connected/route.js   → POST resolve connected state + masked numbers
 components/
   Linker.jsx               → the whole state machine (client)
+  DeviceList.jsx           → the masked "Your numbers" list
 lib/
   schema.sql               → device_requests + device_credentials DDL (idempotent)
   password.js              → scrypt hashing, verification, strength policy
   credentials.js           → credential store + per-number lockout
+  deviceStore.js           → localStorage of publicIds (never raw numbers)
   db.js                    → pooled pg client, cached across hot reloads
-  phone.js                 → E.164 normalization and validation
+  phone.js                 → E.164 normalization, display masking
   countries.js             → dial codes for the selector
   rateLimit.js             → DB-backed throttling + IP hashing
   pairingCode.js           → code formatting for display

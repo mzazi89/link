@@ -236,6 +236,36 @@ function createLinkQueue({
   }
 
   /**
+   * Retire the credential for a number whose device has been removed.
+   *
+   * `device_credentials` doubles as the register the site reads to decide
+   * whether a number is still connected, so this row has to go — leave it and
+   * every removed device keeps showing up as connected. It is also the right
+   * privacy call: no reason to keep a password hash for a device that no longer
+   * exists.
+   *
+   * Non-fatal. The session is already gone by the time this runs, and retrying
+   * a completed deletion would be worse than a stale list entry, so a failure
+   * here is loud in the log rather than fatal to the request.
+   */
+  async function clearCredential(phone) {
+    try {
+      const { rowCount } = await pool.query(
+        `DELETE FROM device_credentials WHERE phone = $1`,
+        [phone]
+      )
+      return rowCount > 0
+    } catch (err) {
+      log.error(
+        `could not clear credential for +${mask(phone)} — the number will still ` +
+          `read as connected:`,
+        err.message
+      )
+      return false
+    }
+  }
+
+  /**
    * A failed attempt either goes back to 'pending' for one more try, or is
    * written off. pairing_code is explicitly cleared so the status constraint
    * (no code on a 'pending' row) can never be violated on the retry path.
@@ -332,6 +362,11 @@ function createLinkQueue({
     }
 
     await withTimeout(deleteDevice(row.phone), config.deleteTimeoutMs, 'deleteDevice')
+
+    // Retire the register entry before reporting the removal done, so the number
+    // drops off the site's list the moment it stops being connected.
+    await clearCredential(row.phone)
+
     await markCompleted(row.id)
     log.info(`removed ${row.public_id} → +${mask(row.phone)}`)
   }
@@ -408,13 +443,17 @@ function createLinkQueue({
       if (inFlight.has(row.id)) continue
       try {
         if (await isLinked(row.phone)) {
+          // Promote BEFORE flipping the status, and accept that a lost race may
+          // promote twice. The order matters to observers: `device_credentials`
+          // is what the site reads to decide whether a device is connected, so
+          // if the status said 'linked' before the credential landed, a browser
+          // polling in that window would see a freshly linked number as not
+          // connected. Writing the credential first makes 'linked' imply it.
+          await promoteCredential(row.id)
+
           const changed = await markLinked(row.id)
           if (changed) {
             log.info(`linked ${row.public_id} → +${mask(row.phone)}`)
-
-            // The device is connected, so the password chosen at link time is
-            // now the credential for this number.
-            await promoteCredential(row.id)
 
             if (typeof onLinked === 'function') {
               try {
@@ -509,6 +548,7 @@ function createLinkQueue({
     sweep,
     checkLinks,
     promoteCredential,
+    clearCredential,
     get workerId() {
       return workerId
     },

@@ -2,7 +2,9 @@
 
 import { useCallback, useEffect, useState } from 'react'
 
+import DeviceList from '@/components/DeviceList'
 import { COUNTRIES, DEFAULT_COUNTRY_ISO } from '@/lib/countries'
+import { addDevice, loadDevices, pruneDevices } from '@/lib/deviceStore'
 
 /**
  * The whole device flow lives here: linking and removing.
@@ -197,6 +199,13 @@ export default function Linker() {
   // Drives the countdown. Ticking locally avoids a poll per second.
   const [now, setNow] = useState(() => Date.now())
 
+  // The numbers this browser has linked, resolved through the server so the
+  // masked form and the connected state both come from the truth rather than
+  // from anything this component remembers.
+  const [devices, setDevices] = useState([])
+  const [devicesLoading, setDevicesLoading] = useState(true)
+  const [devicesError, setDevicesError] = useState(null)
+
   const country = COUNTRIES.find((c) => c.iso === countryIso) ?? COUNTRIES[0]
   const publicId = request?.publicId || null
   const busy = phase === 'submitting'
@@ -234,6 +243,63 @@ export default function Linker() {
     setConfirm('')
     setAcknowledged(false)
   }, [mode])
+
+  // ── Connected numbers ─────────────────────────────────────────────────────
+  // The browser supplies only the references it holds; the server decides which
+  // are still connected and returns the masked form. Nothing about other
+  // people's numbers ever reaches this page.
+  const refreshDevices = useCallback(async () => {
+    const stored = loadDevices()
+    if (stored.length === 0) {
+      setDevices([])
+      setDevicesError(null)
+      setDevicesLoading(false)
+      return
+    }
+
+    setDevicesLoading(true)
+    try {
+      const res = await fetch('/api/connected', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ publicIds: stored.map((d) => d.publicId) }),
+      })
+      const data = await res.json().catch(() => null)
+      if (!res.ok || !data?.ok) throw new Error(data?.message || 'unavailable')
+
+      setDevices(data.devices)
+      setDevicesError(null)
+
+      // Drop anything the server no longer recognises as connected — a device
+      // removed from another browser, or a reference that never linked — so this
+      // browser's storage does not accumulate dead entries.
+      pruneDevices(data.devices.filter((d) => d.connected).map((d) => d.publicId))
+    } catch {
+      setDevicesError('Could not load your numbers.')
+    } finally {
+      setDevicesLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    refreshDevices()
+  }, [refreshDevices])
+
+  // Remember the reference the moment a link succeeds. The bot promotes the
+  // password before it flips the status, so by now the number really is
+  // connected and the next read will agree.
+  useEffect(() => {
+    if (phase !== 'linked' || !request?.publicId) return
+    addDevice(request.publicId)
+    refreshDevices()
+  }, [phase, request?.publicId, refreshDevices])
+
+  // A finished removal has already cleared the credential server-side, so this
+  // is purely re-reading the truth.
+  useEffect(() => {
+    if (phase !== 'completed') return
+    refreshDevices()
+  }, [phase, refreshDevices])
 
   // ── Polling ───────────────────────────────────────────────────────────────
   // Stays alive through 'ready' as well, because the transition we actually care
@@ -765,6 +831,14 @@ export default function Linker() {
           </div>
         ) : null}
       </div>
+
+      <DeviceList
+        devices={devices}
+        loading={devicesLoading}
+        error={devicesError}
+        onRemove={() => reset('remove')}
+        onRefresh={refreshDevices}
+      />
     </div>
   )
 }
