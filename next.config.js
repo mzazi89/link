@@ -17,7 +17,7 @@ const nextConfig = {
       '/api/link': ['./lib/schema.sql'],
       '/api/unlink': ['./lib/schema.sql'],
       '/api/connected': ['./lib/schema.sql'],
-      '/api/requests/[publicId]': ['./lib/schema.sql'],
+      '/api/requests/[id]': ['./lib/schema.sql'],
       '/api/init-db': ['./lib/schema.sql'],
     },
   },

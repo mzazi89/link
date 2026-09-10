@@ -1,16 +1,17 @@
 import { NextResponse } from 'next/server'
-import { randomBytes } from 'node:crypto'
 
+import { createUnpairRequest, findInFlight, promoteCredential } from '@/lib/botControl'
+import { isKnownSession } from '@/lib/botStatus'
 import {
   clearFailedAttempts,
   loadCredential,
   lockoutRemainingSeconds,
   registerFailedAttempt,
 } from '@/lib/credentials'
-import { notifyRequest, query, unavailable } from '@/lib/db'
+import { notifyRequest, unavailable } from '@/lib/db'
 import { legacyFallbackEnabled, verifyLegacyPassword } from '@/lib/legacyPassword'
 import { burnVerificationTime, verifyPassword } from '@/lib/password'
-import { describeReason, formatE164, maskMsisdn, normalizePhone } from '@/lib/phone'
+import { describeReason, maskForDisplay, normalizePhone } from '@/lib/phone'
 import {
   checkVerificationLimits,
   clientIpFrom,
@@ -18,274 +19,173 @@ import {
   hashIp,
   maybePruneAttempts,
   recordPasswordAttempt,
+  recordRequest,
 } from '@/lib/rateLimit'
-import { findActiveSession } from '@/lib/sessions'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 
 const NO_STORE = { 'Cache-Control': 'no-store' }
 
-/**
- * One message for every rejection.
- *
- * A wrong password, a number that was never linked, and a number with no session
- * must all be indistinguishable, or this endpoint becomes a way to test whether
- * a given phone number uses the service. Same wording, and the same amount of
- * cryptographic work, on every failing path.
- */
+const json = (payload, status = 200) =>
+  NextResponse.json(payload, { status, headers: NO_STORE })
+
+// One message for every rejection. A wrong password, a number that was never
+// linked, and a number with no password at all must be indistinguishable, or
+// this endpoint becomes a way to test whether any given phone uses the service.
 const GENERIC_FAILURE = 'Those details do not match a linked device.'
 
 /**
- * Authorise and queue a device deletion.
- *
- * Body: { dialCode: "254", national: "712345678", password: "..." }
- *
- * Two ways a password can be accepted:
- *
- *   1. A real credential exists — set when the user linked the number through
- *      this site. Verified against the stored scrypt hash.
- *
- *   2. No credential, but the number IS an active session — meaning it was
- *      paired back when nobody was asked for a password. These fall back to the
- *      primary password (LEGACY_DEFAULT_PASSWORDS), because otherwise those
- *      sessions would be impossible to remove from this page.
- *
- * Branch 2 is a deliberate concession, not a good password. See
- * lib/legacyPassword.js for what it costs and how to close it out.
- *
- * The site never deletes anything itself — it has no access to the session
- * folders. On success it queues an `action = 'delete'` row and the bot wipes the
- * session on its own terms.
+ * Queue a removal, gated on the password set when the number was linked.
  */
 export async function POST(request) {
   let body
   try {
     body = await request.json()
   } catch {
-    return NextResponse.json(
-      { ok: false, error: 'bad_request', message: 'Expected a JSON body.' },
-      { status: 400, headers: NO_STORE }
-    )
+    return json({ ok: false, error: 'bad_request', message: 'Expected a JSON body.' }, 400)
   }
 
-  const parsed = normalizePhone(body?.dialCode, body?.national)
-  if (!parsed.ok) {
-    return NextResponse.json(
-      { ok: false, error: parsed.reason, message: describeReason(parsed.reason) },
-      { status: 400, headers: NO_STORE }
+  const normalized = normalizePhone(body?.dialCode, body?.national)
+  if (!normalized.ok) {
+    return json(
+      { ok: false, error: normalized.reason, message: describeReason(normalized.reason) },
+      400
     )
   }
+  const phone = normalized.msisdn
 
-  const { msisdn, dialCode } = parsed
-  const password = String(body?.password ?? '')
-
+  const password = typeof body?.password === 'string' ? body.password : ''
   if (!password) {
-    return NextResponse.json(
-      {
-        ok: false,
-        error: 'password_empty',
-        message: 'Enter the password you set when you linked this device.',
-      },
-      { status: 400, headers: NO_STORE }
-    )
+    return json({ ok: false, error: 'password_required', message: 'Enter your password.' }, 400)
   }
 
-  const ip = clientIpFrom(request.headers)
-  const ipHash = hashIp(ip)
+  const ipHash = hashIp(clientIpFrom(request.headers))
 
-  // Throttle before verifying — scrypt is expensive on purpose, and that cost is
-  // exactly what would make an unthrottled endpoint worth attacking.
   try {
     const limit = await checkVerificationLimits({ ipHash })
     if (!limit.allowed) {
-      return NextResponse.json(
+      return json(
         {
           ok: false,
           error: 'rate_limited',
-          scope: limit.scope,
           retryAfterSeconds: limit.retryAfterSeconds,
           message: describeRetry(limit.retryAfterSeconds),
         },
-        {
-          status: 429,
-          headers: { ...NO_STORE, 'Retry-After': String(limit.retryAfterSeconds || 60) },
-        }
+        429
       )
     }
   } catch (err) {
     console.error('[link][unlink] throttle check failed:', err.message)
-    return NextResponse.json(
+    return json(
       unavailable(err, 'Removal is temporarily unavailable. Please try again shortly.'),
-      { status: 503, headers: NO_STORE }
+      503
     )
   }
 
-  const reject = async (reason) => {
-    await recordPasswordAttempt({ phone: msisdn, ipHash, success: false })
-    void maybePruneAttempts()
-    return NextResponse.json(
-      { ok: false, error: reason, message: GENERIC_FAILURE },
-      { status: 401, headers: NO_STORE }
-    )
-  }
-
-  let credential
   try {
-    credential = await loadCredential(msisdn)
-  } catch (err) {
-    console.error('[link][unlink] credential lookup failed:', err.message)
-    return NextResponse.json(
-      unavailable(err, 'Removal is temporarily unavailable.'),
-      { status: 503, headers: NO_STORE }
-    )
-  }
-
-  let authorised = false
-  let usedPrimaryPassword = false
-
-  if (credential) {
-    // ── Branch 1: a real password was set when this number was linked ────────
-    const lockedFor = lockoutRemainingSeconds(credential)
-    if (lockedFor > 0) {
-      // Reported with the same status and wording as an IP throttle, so the two
-      // cannot be told apart from outside.
-      return NextResponse.json(
-        {
-          ok: false,
-          error: 'rate_limited',
-          scope: 'ip',
-          retryAfterSeconds: lockedFor,
-          message: describeRetry(lockedFor),
-        },
-        { status: 429, headers: { ...NO_STORE, 'Retry-After': String(lockedFor) } }
-      )
+    // Repair, before reading: if a pairing completed while the browser was
+    // closed, the password is still staged on its request row. Promoting here
+    // means the user is not locked out of a number they legitimately own.
+    try {
+      await promoteCredential(phone)
+    } catch (err) {
+      console.warn('[link][unlink] credential repair failed:', err.message)
     }
 
-    try {
+    const credential = await loadCredential(phone)
+    let authorised = false
+    let usedLegacyPassword = false
+
+    if (credential) {
+      const lockedFor = lockoutRemainingSeconds(credential)
+      if (lockedFor > 0) {
+        // Reported with scope 'ip' rather than a number-specific message, so a
+        // lockout cannot be told apart from the IP throttle.
+        return json(
+          {
+            ok: false,
+            error: 'rate_limited',
+            scope: 'ip',
+            retryAfterSeconds: lockedFor,
+            message: describeRetry(lockedFor),
+          },
+          429
+        )
+      }
+
       authorised = await verifyPassword(password, credential.password_hash)
-    } catch (err) {
-      console.error('[link][unlink] verification error:', err.message)
+      if (!authorised) {
+        try {
+          await registerFailedAttempt(phone)
+        } catch (err) {
+          console.warn('[link][unlink] could not record failed attempt:', err.message)
+        }
+      }
+    } else {
+      // No credential. That is either a number that was never linked, or one
+      // paired before this site existed. Only the bot's session list can tell
+      // them apart.
+      const known = await isKnownSession(phone)
+      if (!known) {
+        await burnVerificationTime()
+      } else if (legacyFallbackEnabled()) {
+        authorised = await verifyLegacyPassword(password)
+        usedLegacyPassword = authorised
+      } else {
+        await burnVerificationTime()
+      }
     }
 
     if (!authorised) {
+      await recordPasswordAttempt({ phone, ipHash, success: false })
+      maybePruneAttempts()
+      return json({ ok: false, error: 'not_authorised', message: GENERIC_FAILURE }, 401)
+    }
+
+    await recordPasswordAttempt({ phone, ipHash, success: true })
+    if (credential) {
       try {
-        const state = await registerFailedAttempt(msisdn)
-        if (state && new Date(state.locked_until).getTime() > Date.now()) {
-          console.warn(
-            `[link][unlink] locked ${maskMsisdn(msisdn)} after repeated failures`
-          )
-        }
+        await clearFailedAttempts(phone)
       } catch (err) {
-        console.error('[link][unlink] could not register failed attempt:', err.message)
+        console.warn('[link][unlink] could not clear failed attempts:', err.message)
       }
-      return reject('no_match')
+    } else if (usedLegacyPassword) {
+      console.warn(
+        `[link][unlink] removal authorised by a primary password for +${phone.slice(0, 3)}…`
+      )
     }
 
-    try {
-      await clearFailedAttempts(msisdn)
-    } catch (err) {
-      console.warn('[link][unlink] could not clear failed attempts:', err.message)
-    }
-  } else {
-    // ── Branch 2: no credential — primary password, but only for real sessions
-    let session = null
-    try {
-      session = await findActiveSession(msisdn)
-    } catch (err) {
-      console.error('[link][unlink] session lookup failed:', err.message)
-      return NextResponse.json(unavailable(err, 'Removal is temporarily unavailable.'), {
-        status: 503,
-        headers: NO_STORE,
-      })
+    if (await findInFlight(phone, 'unpair')) {
+      return json(
+        {
+          ok: false,
+          error: 'already_pending',
+          message: 'A removal for this number is already in progress. Give it a moment.',
+        },
+        409
+      )
     }
 
-    if (!session || !legacyFallbackEnabled()) {
-      // Unknown number, or the fallback is switched off. Spend the same work a
-      // real check would, then answer identically.
-      await burnVerificationTime()
-      return reject('no_match')
-    }
+    await recordRequest({ action: 'unpair', phone, ipHash })
+    const created = await createUnpairRequest(phone)
 
-    // No per-number lockout is possible here — there is no credential row to
-    // count against. The per-IP throttle above is the only brake, which is
-    // acceptable precisely because this password is not a secret. Worth knowing
-    // if you ever raise the fallback password to something meaningful: add the
-    // lockout before you do.
-    usedPrimaryPassword = await verifyLegacyPassword(password)
+    // Same optional speed path as pairing — see the note in /api/link.
+    notifyRequest(String(created.id))
 
-    if (!usedPrimaryPassword) {
-      return reject('no_match')
-    }
-
-    console.warn(
-      `[link][unlink] ${maskMsisdn(msisdn)} removed using the PRIMARY password — ` +
-        `this number has no password of its own`
-    )
-    // Counted as a success so it does not push the caller toward the IP limit.
-    await recordPasswordAttempt({ phone: msisdn, ipHash, success: true })
-    void maybePruneAttempts()
-  }
-
-  if (credential && authorised) {
-    await recordPasswordAttempt({ phone: msisdn, ipHash, success: true })
-    void maybePruneAttempts()
-  }
-
-  const publicId = randomBytes(18).toString('base64url')
-  const ttlMinutes = Number.parseInt(process.env.LINK_TTL_MINUTES ?? '', 10) || 10
-
-  try {
-    const { rows } = await query(
-      `
-      INSERT INTO device_requests
-        (public_id, action, phone, dial_code, ip_hash, user_agent, expires_at)
-      VALUES
-        ($1, 'delete', $2, $3, $4, $5, now() + make_interval(mins => $6::int))
-      RETURNING public_id, status, created_at, expires_at
-      `,
-      [
-        publicId,
-        msisdn,
-        dialCode,
-        ipHash,
-        (request.headers.get('user-agent') || '').slice(0, 300),
-        ttlMinutes,
-      ]
-    )
-
-    const row = rows[0]
-
-    // Committed, so a bot may now be woken to act on it immediately.
-    await notifyRequest(row.public_id)
-
-    return NextResponse.json(
-      {
-        ok: true,
-        publicId: row.public_id,
-        action: 'delete',
-        status: row.status,
-        phone: formatE164(msisdn),
-        maskedPhone: maskMsisdn(msisdn),
-        dialCode,
-        usedPrimaryPassword,
-        createdAt: row.created_at,
-        expiresAt: row.expires_at,
-      },
-      { status: 201, headers: NO_STORE }
-    )
+    return json({
+      ok: true,
+      requestId: created.id,
+      action: 'delete',
+      maskedPhone: maskForDisplay(phone),
+      createdAt: created.created_at,
+    })
   } catch (err) {
-    console.error('[link][unlink] insert failed:', err.message)
-    return NextResponse.json(
-      unavailable(err, 'Could not queue the removal. Please try again shortly.'),
-      { status: 503, headers: NO_STORE }
-    )
+    console.error('[link][unlink] could not queue removal:', err.message)
+    return json(unavailable(err, 'Could not queue the removal. Please try again shortly.'), 503)
   }
 }
 
 export async function GET() {
-  return NextResponse.json(
-    { ok: false, error: 'method_not_allowed', message: 'Use POST to remove a device.' },
-    { status: 405, headers: { ...NO_STORE, Allow: 'POST' } }
-  )
+  return json({ ok: false, error: 'method_not_allowed' }, 405)
 }

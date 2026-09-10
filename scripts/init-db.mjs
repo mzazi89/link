@@ -60,7 +60,7 @@ const pool = new Pool({
 // no longer exists would make this script fail AFTER successfully applying the
 // schema, which is the most misleading outcome possible — it looks like the
 // apply failed when it did not.
-const TABLES = ['device_requests', 'device_credentials', 'password_attempts', 'bot_sessions']
+const TABLES = ['device_credentials', 'password_attempts', 'request_log']
 
 const host = connectionString.replace(/^.*@/, '').replace(/[/?].*$/, '')
 

@@ -1,8 +1,9 @@
 import { NextResponse } from 'next/server'
 
+import { readBotStatus } from '@/lib/botStatus'
 import { unavailable } from '@/lib/db'
+import { deviceKey } from '@/lib/deviceKey'
 import { maskForDisplay } from '@/lib/phone'
-import { listActiveSessions, sessionKey } from '@/lib/sessions'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
@@ -10,41 +11,54 @@ export const dynamic = 'force-dynamic'
 const NO_STORE = { 'Cache-Control': 'no-store' }
 
 /**
- * The numbers the bot is currently connected to.
+ * Every number the bot is currently connected to, with telemetry.
  *
- * This list is derived from the bot's session folders, published into
- * `bot_sessions` by the worker's sync job — the site itself is serverless and
- * cannot read that directory. Whatever the bot fails to report does not appear.
+ * Read straight from the bot's heartbeat (`bot_status`), which quartz already
+ * maintains — the same source quartzxd uses. No syncing, no second register, and
+ * no way for this list to drift from what the bot actually holds.
  *
- * ── This is a PUBLIC list ────────────────────────────────────────────────────
+ * Two deliberate departures from quartzxd:
  *
- * There is no login and this takes no parameters, so anyone who opens the page
- * sees every connected number. The only protection is the masking: the middle
- * digits are never sent, so a visitor sees `254741****86` and not the number
- * itself.
+ *   Numbers are masked. quartzxd prints them in full; the author of this site
+ *   asked for the middle digits hidden, and this endpoint is public with no
+ *   parameters, so a full number here is a full number for anyone who loads the
+ *   page.
  *
- * That is a real exposure and worth being explicit about. A visitor can see how
- * many customers there are, watch the number grow, and — because the mask keeps
- * six leading and two trailing digits — narrow any specific entry substantially.
- * If that is not acceptable, this endpoint is the one to gate.
- *
- * `has_password` from the register is deliberately NOT included. Publishing
- * which numbers still rely on the primary password would be publishing a list of
- * exactly which devices can be removed with a well-known default.
+ *   A stale heartbeat is not reported as online. If the row has not been written
+ *   for five minutes, the boolean inside it is history rather than status.
  */
 export async function GET() {
   try {
-    const rows = await listActiveSessions()
+    const status = await readBotStatus()
 
-    const devices = rows.map((row) => ({
-      id: sessionKey(row.phone),
-      maskedPhone: maskForDisplay(row.phone),
+    const devices = status.devices.map((d) => ({
+      // Stable opaque identity, so the page can match "the number I just paired"
+      // against this list without either side holding the number.
+      id: deviceKey(d.phone),
+      maskedPhone: maskForDisplay(d.phone),
       connected: true,
-      connectedSince: row.first_seen_at,
+      online: d.online,
+      // battery/plugged are null when the Baileys build does not report them.
+      // quartzxd's README notes the current build does not, so these render as a
+      // dash — the pipeline is what matters, and it lights up on its own.
+      battery: d.battery,
+      plugged: d.plugged,
+      lastSeen: d.lastSeen,
     }))
 
     return NextResponse.json(
-      { ok: true, count: devices.length, devices },
+      {
+        ok: true,
+        botKnown: status.known,
+        botOnline: status.botOnline,
+        stale: status.stale,
+        ip: status.ip,
+        version: status.version,
+        uptimeSeconds: status.uptimeSeconds,
+        lastSeenAt: status.lastSeenAt,
+        count: devices.length,
+        devices,
+      },
       { headers: NO_STORE }
     )
   } catch (err) {
@@ -58,11 +72,7 @@ export async function GET() {
 
 export async function POST() {
   return NextResponse.json(
-    {
-      ok: false,
-      error: 'method_not_allowed',
-      message: 'Use GET. This list takes no parameters.',
-    },
-    { status: 405, headers: { ...NO_STORE, Allow: 'GET' } }
+    { ok: false, error: 'method_not_allowed' },
+    { status: 405, headers: NO_STORE }
   )
 }

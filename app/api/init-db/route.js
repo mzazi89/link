@@ -43,8 +43,9 @@ const NO_STORE = { 'Cache-Control': 'no-store' }
  * never drops a table or a row, so even a leaked key cannot destroy data.
  */
 
-// Hardcoded, so nothing here is interpolated from user input.
-const TABLES = ['device_requests', 'device_credentials', 'password_attempts', 'bot_sessions']
+// Hardcoded, so nothing here is interpolated from user input. Only the tables
+// this site owns — bot_control and bot_status belong to quartz.
+const TABLES = ['device_credentials', 'password_attempts', 'request_log']
 
 function sameKey(a, b) {
   const left = Buffer.from(String(a ?? ''))

@@ -1,50 +1,34 @@
 import { NextResponse } from 'next/server'
-import { randomBytes } from 'node:crypto'
 
-import { notifyRequest, query, unavailable } from '@/lib/db'
+import { createPairRequest, findInFlight } from '@/lib/botControl'
+import { isBotOnline } from '@/lib/botStatus'
+import { notifyRequest, unavailable } from '@/lib/db'
 import { hashPassword, validatePasswordStrength } from '@/lib/password'
-import { describeReason, formatE164, maskMsisdn, normalizePhone } from '@/lib/phone'
+import { describeReason, formatE164, maskForDisplay, normalizePhone } from '@/lib/phone'
 import {
   checkRateLimits,
   clientIpFrom,
   describeRetry,
   hashIp,
+  recordRequest,
 } from '@/lib/rateLimit'
 
-// node-postgres is not Edge-compatible, and the queue needs a real TCP socket.
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 
 const NO_STORE = { 'Cache-Control': 'no-store' }
 
+// How long the page tells the user their code is good for. WhatsApp rotates
+// pairing codes on its own schedule, so this is guidance to the user, not a
+// server-enforced deadline — nothing here expires the request.
+const CODE_TTL_MINUTES = Number(process.env.CODE_TTL_MINUTES || 3)
+
 /**
- * Create a link request.
+ * Queue a pairing request.
  *
- * Body: { dialCode: "254", national: "712345678", password: "hunter2hunter" }
- *
- * Returns a publicId the browser polls with. The row lands in `pending` and the
- * quartz bot picks it up from there.
- *
- * ── The password ─────────────────────────────────────────────────────────────
- *
- * The user chooses it here, and it is what authorises deleting this number
- * later. We store only a scrypt hash, and we store it ON THE REQUEST rather than
- * in device_credentials — the bot promotes it only once the device has actually
- * connected.
- *
- * That indirection is the security-relevant part. If we wrote the credential on
- * submission, anyone could claim a stranger's number by queueing a request with
- * their own password and permanently lock out the real owner. A promotion
- * happens only after a pairing code has been typed into the target phone, so
- * whoever holds the password is provably holding the phone.
- *
- * ── What we deliberately do NOT do ───────────────────────────────────────────
- *
- * We never report whether the number is already linked to the bot. This endpoint
- * is unauthenticated, so a "that number is already in use" reply would turn it
- * into a free oracle for testing whether any given phone number uses the
- * service. Requests are queued regardless and the bot decides — it can see its
- * own session folders.
+ * Writes one `bot_control` row and returns its id. The bot is already polling
+ * that table, so this needs nothing from quartz — which is the whole point of
+ * moving off the previous design.
  */
 export async function POST(request) {
   let body
@@ -57,20 +41,17 @@ export async function POST(request) {
     )
   }
 
-  const parsed = normalizePhone(body?.dialCode, body?.national)
-  if (!parsed.ok) {
+  const normalized = normalizePhone(body?.dialCode, body?.national)
+  if (!normalized.ok) {
     return NextResponse.json(
-      { ok: false, error: parsed.reason, message: describeReason(parsed.reason) },
+      { ok: false, error: normalized.reason, message: describeReason(normalized.reason) },
       { status: 400, headers: NO_STORE }
     )
   }
+  const phone = normalized.msisdn
 
-  const { msisdn, dialCode } = parsed
-
-  // Validate the password before anything expensive. Cheap shape checks first,
-  // then throttling, and only then scrypt — so a flood of requests cannot make
-  // us burn 16 MiB of memory per call before the limiter has had a say.
-  const strength = validatePasswordStrength(body?.password, msisdn)
+  // Policy before hashing: rejecting a weak password is free, hashing it is not.
+  const strength = validatePasswordStrength(body?.password, phone)
   if (!strength.ok) {
     return NextResponse.json(
       { ok: false, error: strength.reason, message: strength.message },
@@ -78,15 +59,25 @@ export async function POST(request) {
     )
   }
 
-  const ip = clientIpFrom(request.headers)
-  const ipHash = hashIp(ip)
+  const ipHash = hashIp(clientIpFrom(request.headers))
 
-  let limit
   try {
-    limit = await checkRateLimits({ ipHash, phone: msisdn })
+    const limit = await checkRateLimits({ ipHash, phone })
+    if (!limit.allowed) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: 'rate_limited',
+          scope: limit.scope,
+          retryAfterSeconds: limit.retryAfterSeconds,
+          message: describeRetry(limit.retryAfterSeconds),
+        },
+        { status: 429, headers: NO_STORE }
+      )
+    }
   } catch (err) {
-    // Fail closed. If we cannot prove the caller is under the limit, we do not
-    // queue work for the bot — an outage must not become an open door.
+    // Fail closed: if we cannot prove the caller is under the limit, we do not
+    // queue work for the bot.
     console.error('[link][api] rate limit check failed:', err.message)
     return NextResponse.json(
       unavailable(err, 'Linking is temporarily unavailable. Please try again shortly.'),
@@ -94,84 +85,66 @@ export async function POST(request) {
     )
   }
 
-  if (!limit.allowed) {
-    return NextResponse.json(
-      {
-        ok: false,
-        error: 'rate_limited',
-        scope: limit.scope,
-        retryAfterSeconds: limit.retryAfterSeconds,
-        message: describeRetry(limit.retryAfterSeconds),
-      },
-      {
-        status: 429,
-        headers: { ...NO_STORE, 'Retry-After': String(limit.retryAfterSeconds || 60) },
-      }
-    )
-  }
-
-  // 18 random bytes → 24 base64url chars. Not derivable from the row id, so the
-  // endpoint cannot be walked to read other people's pairing codes.
-  const publicId = randomBytes(18).toString('base64url')
-  const ttlMinutes = Number.parseInt(process.env.LINK_TTL_MINUTES ?? '', 10) || 10
-
-  let passwordHash
   try {
-    passwordHash = await hashPassword(body.password)
-  } catch (err) {
-    console.error('[link][api] hashing failed:', err.message)
-    return NextResponse.json(
-      {
-        ok: false,
-        error: 'unavailable',
-        message: 'Could not prepare your request. Please try again shortly.',
-      },
-      { status: 503, headers: NO_STORE }
-    )
-  }
+    // A code is produced by the bot. Queueing one while it is offline just parks
+    // the user in front of a spinner, so say so instead.
+    if (!(await isBotOnline())) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: 'bot_offline',
+          message:
+            'The bot is offline, so it cannot generate a pairing code right now. Try again shortly.',
+        },
+        { status: 503, headers: NO_STORE }
+      )
+    }
 
-  try {
-    const { rows } = await query(
-      `
-      INSERT INTO device_requests
-        (public_id, action, phone, dial_code, password_hash, ip_hash, user_agent, expires_at)
-      VALUES
-        ($1, 'link', $2, $3, $4, $5, $6, now() + make_interval(mins => $7::int))
-      RETURNING public_id, status, created_at, expires_at
-      `,
-      [
-        publicId,
-        msisdn,
-        dialCode,
-        passwordHash,
-        ipHash,
-        (request.headers.get('user-agent') || '').slice(0, 300),
-        ttlMinutes,
-      ]
-    )
+    // Two codes for one number would race, and only one can be entered.
+    if (await findInFlight(phone, 'pair')) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: 'already_pending',
+          message:
+            'A pairing request for this number is already in progress. Give it a moment.',
+        },
+        { status: 409, headers: NO_STORE }
+      )
+    }
 
-    const row = rows[0]
+    await recordRequest({ action: 'pair', phone, ipHash })
 
-    // The row is committed, so the bot can safely be told to look now rather
-    // than waiting for its next poll.
-    await notifyRequest(row.public_id)
+    // Last, because it is the only expensive step and every check above is cheap.
+    const passwordHash = await hashPassword(body.password)
+    const created = await createPairRequest(phone, passwordHash)
+
+    // OPTIONAL SPEED PATH. The bot finds this on its own poll (quartzxd's README
+    // puts that at ~15s), so this notification does nothing on its own — quartz
+    // does not LISTEN on the channel. It is here so that adding a LISTEN to the
+    // bot's bot_control consumer turns a 15s wait into an instant one, with no
+    // change on this side. Harmless until then, and async so it never delays the
+    // response.
+    notifyRequest(String(created.id))
+
+    const expiresAt = new Date(
+      new Date(created.created_at).getTime() + CODE_TTL_MINUTES * 60_000
+    ).toISOString()
 
     return NextResponse.json(
       {
         ok: true,
-        publicId: row.public_id,
-        action: 'link',
-        status: row.status,
-        phone: formatE164(msisdn),
-        maskedPhone: maskMsisdn(msisdn),
-        dialCode,
-        createdAt: row.created_at,
-        expiresAt: row.expires_at,
+        requestId: created.id,
+        action: 'pair',
+        phone: formatE164(phone),
+        maskedPhone: maskForDisplay(phone),
+        createdAt: created.created_at,
+        expiresAt,
       },
-      { status: 201, headers: NO_STORE }
+      { headers: NO_STORE }
     )
   } catch (err) {
-    console.error('[link][api] insert failed:', err.message)
+    console.error('[link][api] could not queue pairing:', err.message)
     return NextResponse.json(
       unavailable(err, 'Could not queue your request. Please try again shortly.'),
       { status: 503, headers: NO_STORE }
@@ -181,7 +154,7 @@ export async function POST(request) {
 
 export async function GET() {
   return NextResponse.json(
-    { ok: false, error: 'method_not_allowed', message: 'Use POST to create a link request.' },
-    { status: 405, headers: { ...NO_STORE, Allow: 'POST' } }
+    { ok: false, error: 'method_not_allowed' },
+    { status: 405, headers: NO_STORE }
   )
 }

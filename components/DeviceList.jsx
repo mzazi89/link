@@ -1,83 +1,129 @@
 'use client'
 
 /**
- * The numbers the bot is currently connected to.
+ * The bot's connected numbers, as cards.
  *
- * Every value here is masked by the server (`maskForDisplay`), so this component
- * never holds or renders a full phone number — it only lays out what it is
- * given.
+ * Structurally quartzxd's device grid, with two deliberate differences:
+ *
+ *   Numbers are masked. The full number is never sent to the browser — the API
+ *   masks them — so there is nothing here to leak.
+ *
+ *   Removal is not a button on the card. Removing a device requires the password
+ *   set when it was linked, and this component does not have the number to send.
+ *   The card offers to start a removal, which switches to the removal form.
  */
-export default function DeviceList({ devices, loading, error, onRefresh }) {
-  const count = devices.length
+
+function formatLastSeen(iso) {
+  if (!iso) return 'never'
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return '—'
+  const s = Math.max(0, Math.floor((Date.now() - d.getTime()) / 1000))
+  if (s < 60) return `${s}s ago`
+  const m = Math.floor(s / 60)
+  if (m < 60) return `${m}m ago`
+  const h = Math.floor(m / 60)
+  if (h < 24) return `${h}h ago`
+  return d.toLocaleDateString()
+}
+
+function DeviceCard({ device, onRemove }) {
+  const { maskedPhone, online, battery, plugged, lastSeen } = device
 
   return (
-    // Sits inside the Linker card, separated by a hairline rather than given its
-    // own border — one panel, two regions.
-    <section className="border-t hairline" aria-labelledby="connected-heading">
-      <div className="flex items-center justify-between gap-3 border-b px-5 py-3.5 hairline">
-        <span className="label" id="connected-heading">
-          Connected numbers
+    <div className="device">
+      <div className="device-top">
+        <span className="device-number">{maskedPhone}</span>
+        <span className={`badge ${online ? 'online' : 'offline'}`}>
+          <span className={`dot ${online ? 'online' : 'offline'}`} />
+          {online ? 'Online' : 'Offline'}
         </span>
-        <div className="flex items-center gap-3">
-          <span className="label">
-            {loading ? 'Checking' : `${count} ${count === 1 ? 'number' : 'numbers'}`}
+      </div>
+
+      <div className="metrics">
+        <div className="metric">
+          <span className="k">Battery</span>
+          <span className={`v ${battery == null ? 'dim-v' : 'gold-v'}`}>
+            {battery == null ? '—' : `${battery}%`}
           </span>
-          <button
-            type="button"
-            onClick={onRefresh}
-            disabled={loading}
-            className="font-mono text-[10px] uppercase tracking-label text-paper-faint hover:text-amber disabled:opacity-40"
-          >
-            Refresh
-          </button>
+        </div>
+        <div className="metric">
+          <span className="k">Charging</span>
+          <span className={`v ${plugged == null ? 'dim-v' : plugged ? 'green-v' : ''}`}>
+            {plugged == null ? '—' : plugged ? 'Yes' : 'No'}
+          </span>
+        </div>
+        <div className="metric">
+          <span className="k">Last seen</span>
+          <span className="v muted-v" style={{ fontSize: 12.5 }}>
+            {formatLastSeen(lastSeen)}
+          </span>
         </div>
       </div>
 
+      <div className="device-footer">
+        <span className="last-seen">password set</span>
+        <button type="button" className="btn danger small" onClick={() => onRemove()}>
+          Remove
+        </button>
+      </div>
+    </div>
+  )
+}
+
+export default function DeviceList({ devices, loading, error, ip, onRefresh, onRemove }) {
+  const count = devices.length
+
+  return (
+    <section className="card mt-22">
+      <div className="card-title">
+        <h2>Connected numbers</h2>
+        <span className="mono">
+          {ip ? `bot ip ${ip}` : 'bot ip —'} · {count} device{count === 1 ? '' : 's'}
+        </span>
+      </div>
+
       {error ? (
-        <div className="flex items-center justify-between gap-3 px-5 py-4">
-          <p className="text-[12.5px] leading-relaxed text-paper-muted">{error}</p>
-          <button type="button" onClick={onRefresh} className="btn-ghost shrink-0">
+        <div className="error-box">
+          {error}{' '}
+          <button
+            type="button"
+            onClick={onRefresh}
+            style={{
+              background: 'none',
+              border: 'none',
+              color: 'inherit',
+              textDecoration: 'underline',
+              cursor: 'pointer',
+              font: 'inherit',
+              padding: 0,
+            }}
+          >
             Retry
           </button>
         </div>
       ) : null}
 
-      {!error && count > 0 ? (
-        <ul>
-          {devices.map((device) => (
-            <li
-              key={device.id}
-              className="flex items-center justify-between gap-4 border-b px-5 py-3.5 last:border-b-0 hairline"
-            >
-              <p className="truncate font-mono text-[14px] tracking-wide text-paper">
-                {device.maskedPhone}
-              </p>
-              <span className="flex shrink-0 items-center gap-2">
-                <span
-                  className="h-1.5 w-1.5 rounded-full bg-amber"
-                  aria-hidden="true"
-                />
-                <span className="font-mono text-[10px] uppercase tracking-label text-paper-faint">
-                  Live
-                </span>
-              </span>
-            </li>
+      {loading && count === 0 ? (
+        <div className="empty">
+          <span className="spinner" /> Loading devices…
+        </div>
+      ) : count === 0 ? (
+        <div className="empty">
+          No numbers are connected yet. Generate a code above to link the first
+          one.
+        </div>
+      ) : (
+        <div className="device-grid">
+          {devices.map((d) => (
+            <DeviceCard key={d.id} device={d} onRemove={onRemove} />
           ))}
-        </ul>
-      ) : null}
+        </div>
+      )}
 
-      {!error && !loading && count === 0 ? (
-        <p className="px-5 py-4 text-[12.5px] leading-relaxed text-paper-muted">
-          No numbers are connected to the bot right now.
-        </p>
-      ) : null}
-
-      <div className="border-t px-5 py-3 hairline">
-        <p className="text-[11.5px] leading-relaxed text-paper-faint">
-          Numbers currently paired with the bot, with the middle digits hidden.
-          Removing one requires the password set when it was linked.
-        </p>
-      </div>
+      <p className="hint">
+        Middle digits are hidden, so a full number is never shown on this page.
+        Battery and charging read “—” until the bot reports them.
+      </p>
     </section>
   )
 }

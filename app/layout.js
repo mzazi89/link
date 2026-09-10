@@ -1,10 +1,29 @@
+import localFont from 'next/font/local'
+
 import './globals.css'
+
+/**
+ * Space Grotesk, self-hosted.
+ *
+ * quartzxd ships the TTFs in app/fonts and loads them this way, so the same
+ * three files are used here — no Google Fonts request, no layout shift, and the
+ * two sites render with byte-identical type.
+ */
+const spaceGrotesk = localFont({
+  src: [
+    { path: './fonts/SpaceGrotesk-Regular.ttf', weight: '400', style: 'normal' },
+    { path: './fonts/SpaceGrotesk-Medium.ttf', weight: '500', style: 'normal' },
+    { path: './fonts/SpaceGrotesk-Bold.ttf', weight: '700', style: 'normal' },
+  ],
+  variable: '--font-display',
+  display: 'swap',
+})
 
 /**
  * Absolute URL used for metadata (canonical links, Open Graph).
  *
  * Resolved from the platform rather than demanded as configuration, so that
- * DATABASE_URL can be the only variable you actually have to set. Order:
+ * DATABASE_URL really is the only variable you have to set. Order:
  *
  *   NEXT_PUBLIC_BASE_URL           explicit override, e.g. a custom domain
  *   VERCEL_PROJECT_PRODUCTION_URL  the stable production domain
@@ -20,32 +39,28 @@ function resolveBaseUrl() {
 
 const baseUrl = resolveBaseUrl()
 
+const TITLE = 'MZAZI LINK — WhatsApp Pairing'
+const DESCRIPTION =
+  'Pair your WhatsApp number with the MZAZI bot. Generate a pairing code, see every connected device, and remove one with the password you set — no login required.'
+
 export const metadata = {
   metadataBase: new URL(baseUrl),
-  title: 'Link a device — MZAZI TECH',
-  description:
-    'Connect your WhatsApp number to the MZAZI TECH bot. Enter your number, get a pairing code, and link the device from WhatsApp. No account needed.',
-  applicationName: 'MZAZI TECH Link',
+  title: TITLE,
+  description: DESCRIPTION,
+  applicationName: 'MZAZI LINK',
   manifest: '/manifest.webmanifest',
   robots: { index: true, follow: true },
   openGraph: {
-    title: 'Link a device — MZAZI TECH',
-    description:
-      'Enter your WhatsApp number and link the device in under a minute. No sign-up required.',
+    title: TITLE,
+    description: DESCRIPTION,
     url: baseUrl,
-    siteName: 'MZAZI TECH',
+    siteName: 'MZAZI LINK',
     type: 'website',
-  },
-  twitter: {
-    card: 'summary_large_image',
-    title: 'Link a device — MZAZI TECH',
-    description: 'Enter your WhatsApp number and link the device in under a minute.',
   },
 }
 
 export const viewport = {
-  themeColor: '#0D0C0B',
-  colorScheme: 'dark',
+  themeColor: '#0B0D0F',
   width: 'device-width',
   initialScale: 1,
 }
@@ -53,20 +68,7 @@ export const viewport = {
 export default function RootLayout({ children }) {
   return (
     <html lang="en">
-      <head>
-        {/* Loaded from the Google Fonts CDN with preconnect rather than via
-            next/font, so the build has no outbound network dependency. */}
-        <link rel="preconnect" href="https://fonts.googleapis.com" />
-        <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="anonymous" />
-        <link
-          rel="stylesheet"
-          href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500&family=Manrope:wght@400;500&family=IBM+Plex+Mono:wght@400&display=swap"
-        />
-      </head>
-      <body className="canvas-wash canvas-frame min-h-screen">
-        {/* Content sits above the fixed wash and frame. */}
-        <div className="relative z-10">{children}</div>
-      </body>
+      <body className={spaceGrotesk.variable}>{children}</body>
     </html>
   )
 }
