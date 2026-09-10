@@ -1,0 +1,28 @@
+{
+  "name": "mzazi-link",
+  "version": "1.0.0",
+  "private": true,
+  "description": "MZAZI TECH — public, login-free WhatsApp device linking site. Hands numbers to the quartz bot through a shared Neon queue table.",
+  "homepage": "https://link.mzazi.shop",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "db:init": "node scripts/init-db.mjs"
+  },
+  "dependencies": {
+    "next": "14.2.35",
+    "pg": "^8.12.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "autoprefixer": "^10.4.19",
+    "postcss": "^8.4.39",
+    "tailwindcss": "^3.4.6"
+  }
+}

@@ -1,0 +1,166 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   Ink & Bolt — warm charcoal canvas, amber and cobalt accents, hairline rules.
+   No gradients on text, no neon, no glow. Typography carries the hierarchy.
+   ───────────────────────────────────────────────────────────────────────────── */
+
+:root {
+  --font-display: 'Space Grotesk';
+  --font-sans: 'Manrope';
+  --font-mono: 'IBM Plex Mono';
+
+  --ink-950: #0d0c0b;
+  --ink-900: #131110;
+  --ink-850: #191715;
+  --ink-800: #201d1a;
+  --ink-700: #2a2622;
+  --ink-600: #3a342e;
+
+  --paper: #f3eee5;
+  --paper-muted: #a69c8d;
+  --paper-faint: #6e665b;
+
+  --amber: #dfa457;
+  --amber-deep: #b87f33;
+  --cobalt: #5b7fb9;
+  --cobalt-deep: #3b5b90;
+
+  /* One hairline value, reused everywhere so rules read as a single system. */
+  --hairline: rgba(243, 238, 229, 0.11);
+  --hairline-strong: rgba(243, 238, 229, 0.2);
+}
+
+@layer base {
+  html {
+    -webkit-text-size-adjust: 100%;
+    scroll-behavior: smooth;
+  }
+
+  body {
+    @apply bg-ink-950 font-sans text-paper antialiased;
+    /* Tabular figures keep the countdown and code from jittering as digits change. */
+    font-variant-numeric: tabular-nums;
+  }
+
+  ::selection {
+    background: var(--amber);
+    color: var(--ink-950);
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--amber);
+    outline-offset: 2px;
+  }
+
+  /* The system is deliberately square-ish; a rounded hairline would fight it. */
+  input,
+  select,
+  button,
+  textarea {
+    border-radius: 2px;
+  }
+}
+
+@layer components {
+  /* Small mono uppercase micro-label — the system's connective tissue. */
+  .label {
+    @apply font-mono text-[10px] uppercase tracking-label text-paper-faint;
+  }
+
+  .label-amber {
+    @apply label text-amber;
+  }
+
+  .hairline {
+    border-color: var(--hairline);
+  }
+
+  .rule {
+    @apply h-px w-full border-0;
+    background: var(--hairline);
+  }
+
+  /* Flat, hairline-bordered input. No inner shadow, no focus ring glow. */
+  .field {
+    @apply w-full border bg-ink-850 px-3 py-3 font-sans text-[15px] text-paper
+           placeholder:text-paper-faint focus:outline-none;
+    border-color: var(--hairline-strong);
+    transition: border-color 140ms ease;
+  }
+
+  .field:hover {
+    border-color: rgba(243, 238, 229, 0.3);
+  }
+
+  .field:focus {
+    border-color: var(--amber);
+    outline: none;
+  }
+
+  .btn-primary {
+    @apply inline-flex w-full items-center justify-center gap-2 border px-5 py-3.5
+           font-mono text-[12px] uppercase tracking-label
+           disabled:cursor-not-allowed disabled:opacity-45;
+    background: var(--amber);
+    border-color: var(--amber);
+    color: var(--ink-950);
+    transition: background-color 140ms ease, border-color 140ms ease;
+  }
+
+  .btn-primary:hover:not(:disabled) {
+    background: var(--amber-deep);
+    border-color: var(--amber-deep);
+  }
+
+  .btn-ghost {
+    @apply inline-flex items-center justify-center gap-2 border bg-transparent px-4 py-2.5
+           font-mono text-[11px] uppercase tracking-label text-paper-muted;
+    border-color: var(--hairline-strong);
+    transition: border-color 140ms ease, color 140ms ease;
+  }
+
+  .btn-ghost:hover {
+    border-color: var(--amber);
+    color: var(--amber);
+  }
+
+  /* Numeric index used by the stepper and the numbered feature rows. */
+  .index-num {
+    @apply font-mono text-[11px] tracking-label text-paper-faint;
+  }
+}
+
+@layer utilities {
+  /* Ambient canvas: two very low-alpha washes plus a vignette. Subtle by
+     design — it should register as depth, never as a light source. */
+  .canvas-wash::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: 0;
+    background:
+      radial-gradient(60rem 30rem at 78% -8%, rgba(223, 164, 87, 0.07), transparent 62%),
+      radial-gradient(48rem 28rem at 4% 104%, rgba(91, 127, 185, 0.07), transparent 60%),
+      radial-gradient(120% 100% at 50% 40%, transparent 55%, rgba(0, 0, 0, 0.5) 100%);
+  }
+
+  /* Hairline frame — the "editorial page" edge. */
+  .canvas-frame::after {
+    content: '';
+    position: fixed;
+    inset: 10px;
+    pointer-events: none;
+    z-index: 0;
+    border: 1px solid var(--hairline);
+  }
+
+  @media (max-width: 640px) {
+    .canvas-frame::after {
+      inset: 6px;
+    }
+  }
+}
