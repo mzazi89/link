@@ -4,12 +4,20 @@ const nextConfig = {
   poweredByHeader: false,
 
   experimental: {
-    // /api/init-db reads lib/schema.sql at runtime with a path built from
-    // process.cwd(). Next's file tracing cannot follow that statically, so
-    // without this the file is left out of the serverless bundle and the
-    // endpoint fails with ENOENT in production only — the worst place to find
-    // out.
+    // lib/db.js reads lib/schema.sql at runtime, with a path built from
+    // process.cwd(), so the app can make sure its own tables exist. Next's file
+    // tracing cannot follow that statically, so without these the file is left
+    // out of the serverless bundle and the read fails with ENOENT in production
+    // only — the worst place to find out.
+    //
+    // Every route that touches the database needs it, because ensureSchema runs
+    // from the shared query helper. Listed explicitly rather than with a broad
+    // glob so a new route missing from this list is obvious in review.
     outputFileTracingIncludes: {
+      '/api/link': ['./lib/schema.sql'],
+      '/api/unlink': ['./lib/schema.sql'],
+      '/api/connected': ['./lib/schema.sql'],
+      '/api/requests/[publicId]': ['./lib/schema.sql'],
       '/api/init-db': ['./lib/schema.sql'],
     },
   },

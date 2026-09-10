@@ -1,10 +1,8 @@
 import { timingSafeEqual } from 'node:crypto'
-import { readFile } from 'node:fs/promises'
-import path from 'node:path'
 
 import { NextResponse } from 'next/server'
 
-import { applySchema, query, schemaExists } from '@/lib/db'
+import { applySchema, query, readSchemaSql, schemaExists } from '@/lib/db'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
@@ -114,19 +112,13 @@ async function run(request) {
     )
   }
 
-  const sqlPath = path.join(process.cwd(), 'lib', 'schema.sql')
-
   let sql
   try {
-    sql = await readFile(sqlPath, 'utf8')
+    sql = await readSchemaSql()
   } catch (err) {
     console.error('[link][init-db] could not read schema:', err.message)
     return NextResponse.json(
-      {
-        ok: false,
-        error: 'schema_unreadable',
-        message: `Could not read ${sqlPath}: ${err.message}`,
-      },
+      { ok: false, error: 'schema_unreadable', message: err.message },
       { status: 500, headers: NO_STORE }
     )
   }

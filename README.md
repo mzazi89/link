@@ -109,14 +109,15 @@ and racing it would leave the row disagreeing with the socket.
 
 ```bash
 npm install
-cp .env.example .env.local     # fill in DATABASE_URL and tune the limits
-npm run db:init                # idempotent — applies lib/schema.sql
+cp .env.example .env.local     # DATABASE_URL is the only value you have to fill in
 npm run dev                    # http://localhost:3000
 ```
 
-`npm run db:init` must run against the **same** database `quartz/` and `web/`
-use. `lib/schema.sql` is entirely idempotent, so it is safe to re-run on every
-deploy.
+Nothing else to do. `DATABASE_URL` must point at the **same** database `quartz/`
+and `web/` use, and the app creates its own tables on first use — see
+[First deploy](#first-deploy-the-schema-applies-itself). `npm run db:init` still
+works if you would rather apply the schema explicitly; `lib/schema.sql` is
+idempotent either way.
 
 > **Upgrading from an earlier version of this schema?** Re-run `npm run db:init`.
 > It renames `link_requests` to `device_requests` and adds the `action` and
@@ -136,6 +137,7 @@ so a deployment with nothing but the connection string behaves correctly.
 | `DATABASE_URL` | **yes** | Neon connection string, shared with the bot and both panels. |
 | `NEXT_PUBLIC_BASE_URL` | no | Derived from `VERCEL_PROJECT_PRODUCTION_URL` (or `VERCEL_URL` for previews), falling back to localhost. Set only to force a custom domain. |
 | `INIT_DB_KEY` | no | Needed only to **re-run** `/api/init-db` once the schema exists. The first run needs no key. |
+| `AUTO_MIGRATE` | no | Set to `off` to stop the app creating missing tables on first use. Only useful if your database user has no DDL rights. |
 | `LEGACY_DEFAULT_PASSWORDS` | no | Primary passwords for numbers that have none (default `1234,0000`). Empty disables the fallback. |
 | `RATE_LIMIT_IP_MAX` / `RATE_LIMIT_IP_WINDOW_MIN` | no | Per-IP cap (default 5 per 15 min). |
 | `RATE_LIMIT_PHONE_MAX` / `RATE_LIMIT_PHONE_WINDOW_MIN` | no | Per-number cap (default 3 per 60 min). |
@@ -247,48 +249,49 @@ Security headers and `Cache-Control: no-store` on `/api/*` are set in
 `next.config.js` — a cached "ready" response would hand someone a code that has
 already rotated.
 
-### First deploy: the schema does not apply itself
+### First deploy: the schema applies itself
 
-Deploying the code and initialising the database are two separate acts. Doing the
-first without the second is the most common way to end up with a site that
-returns 503 for everything, and the log line is unmistakable:
+Deploying the code and initialising the database used to be two separate acts, and
+doing the first without the second was the most common way to end up with a site
+that 503s on everything. It no longer is: on the first request, the app checks for
+its tables and creates any that are missing.
+
+The cost is one catalog query per process, not per request — the full schema runs
+only when something is genuinely absent. `AUTO_MIGRATE=off` turns it off entirely
+if you would rather migrations were a deliberate, separate act.
+
+Two properties are what make this safe to do without asking:
+
+- **Additive.** `CREATE TABLE IF NOT EXISTS`, `ALTER TABLE ADD COLUMN IF NOT
+  EXISTS`, `CREATE OR REPLACE VIEW`, `CREATE INDEX IF NOT EXISTS`. It never drops
+  a table or a row, so re-running it cannot destroy anything.
+- **Serialised.** Several instances booting at once would race on `CREATE TABLE`
+  and fail with duplicate-key errors against the system catalogs. They take a
+  Postgres advisory lock first, re-check inside it, and give up after 5s rather
+  than block a request.
+
+If a missing-schema error still appears, the cause is now logged rather than fatal,
+and one of these will tell you which:
 
 ```
-[link][connected] lookup failed: relation "bot_sessions" does not exist
-[link][api] rate limit check failed: relation "device_requests" does not exist
+# the database user lacks DDL rights, or schema.sql did not ship:
+DATABASE_URL="postgresql://..." npm run db:init   # locally
+https://<your-deployment>/api/init-db             # from the deployment
 ```
 
-The API now detects this (Postgres `42P01`) and answers with
-`error: "schema_missing"` plus the actual fix, rather than a vague 503 that sends
-you hunting for a bug in the wrong place.
-
-Two ways to apply it:
-
-```
-# 1. From the deployment. No key is needed while the schema is missing, so with
-#    nothing but DATABASE_URL configured, just open this in a browser:
-https://<your-deployment>/api/init-db
-
-# 2. Locally, against the production database
-DATABASE_URL="postgresql://..." npm run db:init
-```
-
-Once the tables exist, `/api/init-db` refuses unauthenticated calls, so re-running
-it later — an upgrade, or a repair — needs `INIT_DB_KEY`:
+That endpoint is deliberately asymmetric. While the schema is missing it needs no
+key at all — bootstrapping an empty database with an additive script gains an
+attacker nothing, and demanding a key just to bootstrap is friction with no
+benefit. Once the tables exist it refuses unauthenticated calls, so re-running it
+later needs `INIT_DB_KEY`:
 
 ```
 curl -X POST -H "x-init-key: <value>" https://<your-deployment>/api/init-db
 ```
 
-That asymmetry is deliberate. Bootstrapping an empty database is safe enough to
-leave unauthenticated: the script is purely additive, never drops a table or a
-row, and running it first gains an attacker nothing. A live database, on the other
-hand, should never expose an open DDL endpoint. It also means you can get started
-with `DATABASE_URL` as the only variable you set.
-
-Both routes finish with a per-table row count. **Read that output rather than
-assuming**: if it succeeds but `bot_sessions` is 0, the schema is fine and the
-missing piece is the bot's `listSessions` sync.
+`/api/init-db` and `npm run db:init` both finish with a per-table row count.
+**Read that output rather than assuming**: if it succeeds but `bot_sessions` is 0,
+the schema is fine and the missing piece is the bot's `listSessions` sync.
 
 A key in a query string lands in access logs, so prefer the header when you use one.
 
