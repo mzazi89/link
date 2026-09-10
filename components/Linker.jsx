@@ -22,21 +22,15 @@ const STALLED_AFTER_S = 25
 const COPY = {
   link: {
     endpoint: '/api/link',
-    submit: 'Generate code',
+    submit: 'Get pairing code',
     submitBusy: 'Requesting…',
-    title: 'Generate pairing code',
-    route: 'POST /api/link',
-    hint:
-      'Open WhatsApp → Linked devices → Link a device, then choose "Link with phone number instead" and type the code.',
+    hint: 'WhatsApp → Linked devices → Link with phone number.',
   },
   remove: {
     endpoint: '/api/unlink',
     submit: 'Remove device',
     submitBusy: 'Removing…',
-    title: 'Remove a device',
-    route: 'POST /api/unlink',
-    hint:
-      'This logs the device out of WhatsApp and wipes its session on the bot. Enter the password you set when you linked it.',
+    hint: 'Logs the device out and wipes its session on the bot.',
   },
 }
 
@@ -311,25 +305,28 @@ export default function Linker({ mode, onModeChange, botOnline, onChanged }) {
 
   return (
     <section className="card">
-      <div className="card-title">
-        <h2>{copy.title}</h2>
-        <span className={`chip ${chip[0]}`}>{chip[1]}</span>
-      </div>
-
-      <div className="mode-switch" role="tablist" aria-label="Choose an action">
-        {['link', 'remove'].map((m) => (
-          <button
-            key={m}
-            type="button"
-            role="tab"
-            className="mode-tab"
-            aria-selected={mode === m}
-            disabled={inFlight}
-            onClick={() => (mode === m ? null : reset(m))}
-          >
-            {m === 'link' ? 'Link a device' : 'Remove a device'}
-          </button>
-        ))}
+      {/* The switch and the state chip share one row. The switch already says
+          which flow you are in, so a heading above it was a third line saying the
+          same thing. */}
+      <div className="card-head">
+        <div className="mode-switch" role="tablist" aria-label="Choose an action">
+          {['link', 'remove'].map((m) => (
+            <button
+              key={m}
+              type="button"
+              role="tab"
+              className="mode-tab"
+              aria-selected={mode === m}
+              disabled={inFlight}
+              onClick={() => (mode === m ? null : reset(m))}
+            >
+              {m === 'link' ? 'Link' : 'Remove'}
+            </button>
+          ))}
+        </div>
+        <span className={`chip ${chip[0]}`} role="status" aria-live="polite">
+          {chip[1]}
+        </span>
       </div>
 
       {phase === 'input' || phase === 'submitting' ? (
@@ -366,8 +363,8 @@ export default function Linker({ mode, onModeChange, botOnline, onChanged }) {
               />
             </div>
             <p className="hint">
-              Use the number actually on that phone. A leading zero is dropped for
-              you; pasting the full international number works too.
+              Use the number on that phone. A leading zero is dropped
+              automatically.
             </p>
           </div>
 
@@ -380,7 +377,7 @@ export default function Linker({ mode, onModeChange, botOnline, onChanged }) {
                 onChange={setPassword}
                 disabled={busy}
                 autoComplete="new-password"
-                help="This is not an account password and is never typed on the phone. It is what authorises removing this device later."
+                help="Not an account password, and never typed on the phone. It authorises removing the device later."
               />
               <ul className="req-list" aria-label="Password requirements">
                 {rules.map((r) => (
@@ -405,9 +402,8 @@ export default function Linker({ mode, onModeChange, botOnline, onChanged }) {
                 <p className="notice is-bad">Those two do not match.</p>
               ) : (
                 <p className="notice is-warn">
-                  <strong>Write this password down.</strong> There is no reset —
-                  we have no account to send one to. You can always set a new one
-                  by linking the number again from the phone.
+                  <strong>Write it down — there is no reset.</strong> Relinking
+                  from the phone sets a new one.
                 </p>
               )}
             </>
@@ -479,10 +475,8 @@ export default function Linker({ mode, onModeChange, botOnline, onChanged }) {
 
           {stalled ? (
             <p className="notice is-warn mt-14">
-              The bot has not picked this up yet. Your request is queued correctly,
-              so the likely cause is that the bot is not running — it collects these
-              on its own poll. This page keeps checking, so it will continue on its
-              own if the bot comes back.
+              Nothing has picked this up yet — the bot is probably not running. It
+              stays queued, and this page keeps checking.
             </p>
           ) : null}
 
@@ -501,9 +495,7 @@ export default function Linker({ mode, onModeChange, botOnline, onChanged }) {
 
       {phase === 'ready' ? (
         <div>
-          <p className="notice is-want" style={{ borderLeftColor: 'var(--amber)' }}>
-            Enter this in WhatsApp — the bot has issued it and it is waiting.
-          </p>
+          <p className="notice is-warn">Type this into WhatsApp now — it is live.</p>
 
           <div className="code-box">
             <div className="code">{code}</div>
@@ -518,8 +510,8 @@ export default function Linker({ mode, onModeChange, botOnline, onChanged }) {
               </button>
             </div>
             <p className="hint">
-              For {request?.maskedPhone} — this page will flip to connected on its
-              own once WhatsApp accepts it.
+              For {request?.maskedPhone}. This flips to connected on its own once
+              WhatsApp accepts it.
             </p>
           </div>
 
@@ -539,8 +531,8 @@ export default function Linker({ mode, onModeChange, botOnline, onChanged }) {
       {phase === 'linked' ? (
         <div>
           <p className="notice" style={{ borderLeftColor: 'var(--green)' }}>
-            <strong>Connected.</strong> The bot now holds a session for{' '}
-            {request?.maskedPhone}. You will need the password you set to remove it.
+            <strong>Connected.</strong> {request?.maskedPhone} is live. Your
+            password is what removes it.
           </p>
           <div className="btn-row">
             <button type="button" className="btn primary" onClick={() => reset('link')}>
@@ -553,8 +545,8 @@ export default function Linker({ mode, onModeChange, botOnline, onChanged }) {
       {phase === 'removed' ? (
         <div>
           <p className="notice" style={{ borderLeftColor: 'var(--green)' }}>
-            <strong>Removed.</strong> The device was logged out and its session
-            wiped. It no longer appears in the list below.
+            <strong>Removed.</strong> Logged out and wiped — it is gone from the
+            list.
           </p>
           <div className="btn-row">
             <button type="button" className="btn primary" onClick={() => reset('link')}>

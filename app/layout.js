@@ -3,20 +3,25 @@ import localFont from 'next/font/local'
 import './globals.css'
 
 /**
- * Space Grotesk, self-hosted.
+ * IBM Plex Mono, self-hosted, and used for EVERYTHING — headings, body, labels,
+ * numbers. A monospace display face is the whole point here: it is what gives
+ * the page its terminal character, and it is already the mono in the MZAZI
+ * design system, so this is that identity applied consistently rather than a new
+ * one bolted on.
  *
- * quartzxd ships the TTFs in app/fonts and loads them this way, so the same
- * three files are used here — no Google Fonts request, no layout shift, and the
- * two sites render with byte-identical type.
+ * Self-hosted rather than fetched, for the same reason quartzxd ships its own
+ * type: no third-party request on load, no layout shift, and a build that does
+ * not depend on Google being reachable.
  */
-const spaceGrotesk = localFont({
+const plexMono = localFont({
   src: [
-    { path: './fonts/SpaceGrotesk-Regular.ttf', weight: '400', style: 'normal' },
-    { path: './fonts/SpaceGrotesk-Medium.ttf', weight: '500', style: 'normal' },
-    { path: './fonts/SpaceGrotesk-Bold.ttf', weight: '700', style: 'normal' },
+    { path: './fonts/IBMPlexMono-Regular.ttf', weight: '400', style: 'normal' },
+    { path: './fonts/IBMPlexMono-Medium.ttf', weight: '500', style: 'normal' },
+    { path: './fonts/IBMPlexMono-Bold.ttf', weight: '700', style: 'normal' },
   ],
-  variable: '--font-display',
+  variable: '--font-plex',
   display: 'swap',
+  fallback: ['ui-monospace', 'SFMono-Regular', 'Menlo', 'Consolas', 'monospace'],
 })
 
 /**
@@ -41,7 +46,7 @@ const baseUrl = resolveBaseUrl()
 
 const TITLE = 'MZAZI LINK — WhatsApp Pairing'
 const DESCRIPTION =
-  'Pair your WhatsApp number with the MZAZI bot. Generate a pairing code, see every connected device, and remove one with the password you set — no login required.'
+  'Pair your WhatsApp number with the MZAZI bot. Get a code, see every connected device, and remove one with the password you set. No login.'
 
 export const metadata = {
   metadataBase: new URL(baseUrl),
@@ -63,12 +68,14 @@ export const viewport = {
   themeColor: '#0B0D0F',
   width: 'device-width',
   initialScale: 1,
+  // The pairing code is the one thing that must be readable without pinching.
+  maximumScale: 5,
 }
 
 export default function RootLayout({ children }) {
   return (
     <html lang="en">
-      <body className={spaceGrotesk.variable}>{children}</body>
+      <body className={plexMono.variable}>{children}</body>
     </html>
   )
 }

@@ -2,6 +2,15 @@
    QUARTZ XD — design system
    Warm charcoal ink · amber/gold action · cobalt links · mono labels
    (Ink & Bolt family, matching the MZAZI TECH ecosystem)
+
+   MZAZI LINK carries this file over, with exactly two recorded changes:
+
+     1. The type is a single monospace throughout, replacing the
+        Space Grotesk display face. Marked at --font-* below.
+     2. Everything this site additionally needs (password fields, the mode
+        switch, the step readout, the two-column wide layout, the metric
+        variants) is appended past the marked line at the bottom, so every
+        shared rule above it stays byte-identical to quartzxd's.
    ───────────────────────────────────────────────────────────── */
 
 :root {
@@ -21,8 +30,22 @@
   --red: #E5484D;
   --green: #3ECF8E;
 
-  --font-display: 'Space Grotesk', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-  --font-body: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  /* ── The one deliberate departure from quartzxd's design system ──────────
+     quartzxd pairs a proportional body face with Space Grotesk as the display
+     face. This site runs on a single monospace instead: it is what gives the
+     page its terminal character, and it is the only edit made inside the
+     otherwise-verbatim block below.
+
+     These are fallback-safe defaults, so the page stays monospace even if the
+     self-hosted file never loads. The real family arrives as --font-plex, set on
+     <body> by next/font and mapped over all three variables in the extension
+     section at the bottom of this file.
+
+     Naming a font we do not ship here would be a trap: the override would win
+     normally, and the moment it stopped applying the display type would quietly
+     become a proportional sans and take the whole look with it. */
+  --font-display: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --font-body: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
@@ -830,9 +853,16 @@ select.field {
 @media (max-width: 640px) {
   .form-grid { grid-template-columns: 1fr; }
   .mode-switch { display: flex; }
-  .mode-tab { flex: 1; text-align: center; }
+  .mode-tab { flex: 1; text-align: center; padding: 8px 10px; font-size: 12.5px; }
   .card-title { flex-wrap: wrap; }
   .metrics { grid-template-columns: repeat(3, 1fr); }
+  /* Tighter gutters and padding. On a phone every pixel of width belongs to the
+     content. */
+  .wrap { padding: 0 16px; }
+  .card { padding: 18px; }
+  .device { padding: 14px; }
+  .hero { padding: 34px 0 24px; }
+  .card-head { gap: 8px; }
 }
 
 /* ─── Narrow-phone safety ──────────────────────────────────────────────────── */
@@ -860,3 +890,81 @@ select.field {
   .metric { padding: 8px 6px; }
   .metric .k { letter-spacing: 0.06em; }
 }
+
+/* ─── Type: one hacker mono for the whole page ─────────────────────────────── */
+/* quartzxd's :root declares three families — display, body and mono. All three
+   are pointed at IBM Plex Mono here. The overrides sit on <body> because that is
+   where next/font puts the --font-plex variable, so the reference resolves at the
+   same scope as its definition. The fallback chain inside var() means the page
+   still renders in a monospace stack if the file ever fails to load, rather than
+   dropping to a proportional face and losing the whole character of the thing. */
+body {
+  --font-display: var(--font-plex, 'IBM Plex Mono'), ui-monospace, SFMono-Regular, Menlo, monospace;
+  --font-body: var(--font-display);
+  --font-mono: var(--font-display);
+}
+
+/* A monospace is wider than the proportional face quartzxd sized these against,
+   so the display sizes come down a notch — otherwise the headline wraps to three
+   lines on a phone and the card headings shout. */
+.hero h1 {
+  font-size: clamp(26px, 4.6vw, 44px);
+  line-height: 1.14;
+  letter-spacing: -0.01em;
+  margin: 0 0 12px;
+}
+.hero p { font-size: 14.5px; max-width: 46ch; }
+.hero .kicker { font-size: 11px; letter-spacing: 0.16em; }
+.brand-name { font-size: 16px; letter-spacing: 0.01em; }
+h2 { font-size: 16px; letter-spacing: 0; }
+.card-title .mono { font-size: 10.5px; }
+.code { font-size: clamp(28px, 5.4vw, 38px); letter-spacing: 0.08em; }
+.metric .v { font-size: 15px; }
+.device-number { font-size: 15px; }
+.step-i .t { font-size: 13.5px; }
+.field-label { letter-spacing: 0.1em; }
+.btn { letter-spacing: 0.01em; }
+
+/* ─── Card head: the mode switch and the status chip on one row ────────────── */
+/* Replaces the separate title row the card used to carry. The switch already
+   says which flow you are in, so a heading above it was a row saying the same
+   thing twice. */
+.card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+
+.card-head .mode-switch { margin-bottom: 0; }
+
+/* ─── Wide screens: two columns instead of one long scroll ─────────────────── */
+/* On a phone the two cards must stack. On a desktop a single 1080px column of
+   two cards is a lot of vertical scrolling with a lot of empty margin beside it,
+   so the pairing card and the device list sit side by side. .wrap is already
+   1080px, which is enough for both without stretching either to an unreadable
+   measure — so no container changes are needed. */
+.station { display: grid; gap: 20px; align-items: start; }
+.station > .card { margin-bottom: 0; }
+
+@media (min-width: 1000px) {
+  .station { grid-template-columns: minmax(0, 1.06fr) minmax(0, 1fr); gap: 24px; }
+  .hero { padding: 46px 0 30px; }
+  /* One device per row reads better in a half-width column than two cramped
+     ones, and keeps the Remove button reachable. */
+  .device-grid { grid-template-columns: 1fr; }
+}
+
+/* ─── Metric columns follow the data ───────────────────────────────────────── */
+/* .metrics is fixed at three columns. A card showing only "Seen" would leave two
+   thirds of the row empty, which reads as missing data rather than as a card that
+   simply has less to say. */
+.metrics.cols-1 { grid-template-columns: 1fr; }
+.metrics.cols-2 { grid-template-columns: repeat(2, 1fr); }
+
+/* A single-stat card does not need the metric's stacked label/value spacing to
+   fill a third of the width. */
+.metrics.cols-1 .metric { display: flex; align-items: baseline; gap: 8px; }
+.metrics.cols-1 .metric .k { display: inline; }

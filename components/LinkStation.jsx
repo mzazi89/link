@@ -87,35 +87,38 @@ export default function LinkStation() {
           </span>
         </header>
 
+        {/* Three lines, not three paragraphs. Everything a first-time visitor
+            needs is: what this does, and the fact that the password matters. */}
         <section className="hero">
-          <p className="kicker">WhatsApp · Multi-device · No login</p>
+          <p className="kicker">no login · no account</p>
           <h1>
-            Link your number
-            <br />
-            <span className="gold">in seconds</span>
+            Link a WhatsApp <span className="gold">number</span>
           </h1>
           <p>
-            Get an 8-character pairing code, type it into WhatsApp, and see the
-            device go live. Set a password while you link and that is what removes
-            the device again later — no account, no sign-up.
+            Get a code, type it into WhatsApp. The password you choose is what
+            removes the device again later.
           </p>
         </section>
 
-        <Linker mode={mode} onModeChange={setMode} botOnline={botOnline} onChanged={load} />
+        {/* Stacks on a phone; side by side from 1000px, so a desktop screen is
+            not one long column with half the width empty. */}
+        <div className="station">
+          <Linker mode={mode} onModeChange={setMode} botOnline={botOnline} onChanged={load} />
 
-        <DeviceList
-          devices={devices}
-          loading={loading}
-          error={error}
-          ip={ip}
-          onRefresh={load}
-          onRemove={() => {
-            setMode('remove')
-            if (typeof window !== 'undefined') {
-              window.scrollTo({ top: 0, behavior: 'smooth' })
-            }
-          }}
-        />
+          <DeviceList
+            devices={devices}
+            loading={loading}
+            error={error}
+            ip={ip}
+            onRefresh={load}
+            onRemove={() => {
+              setMode('remove')
+              if (typeof window !== 'undefined') {
+                window.scrollTo({ top: 0, behavior: 'smooth' })
+              }
+            }}
+          />
+        </div>
 
         <footer className="site">
           <span>MZAZI LINK — pairing station · part of the MZAZI TECH ecosystem</span>
