@@ -801,9 +801,10 @@ select.field {
   background: var(--red);
 }
 
-/* ─── Buttons that need to sit full width or beside each other ─────────────── */
+/* ─── Buttons ──────────────────────────────────────────────────────────────── */
+/* .btn-row itself is already defined above — not redeclared here, so there is
+   one source of truth for it. Only the additions. */
 .btn.block { width: 100%; justify-content: center; }
-.btn-row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 18px; }
 .btn-row .btn { flex: 1 1 auto; justify-content: center; }
 
 /* ─── Metric value that needs to read as "no data" ─────────────────────────── */
@@ -832,4 +833,30 @@ select.field {
   .mode-tab { flex: 1; text-align: center; }
   .card-title { flex-wrap: wrap; }
   .metrics { grid-template-columns: repeat(3, 1fr); }
+}
+
+/* ─── Narrow-phone safety ──────────────────────────────────────────────────── */
+/* quartzxd's grid asks for a 300px minimum column. Below roughly a 350px
+   viewport that minimum is wider than the space available, so the column
+   overflows and the row is silently clipped by body's overflow-x. min(300px,
+   100%) lets the track shrink instead. */
+.device-grid {
+  grid-template-columns: repeat(auto-fill, minmax(min(300px, 100%), 1fr));
+}
+
+/* Nothing in a card may push the card wider than its container. A masked number
+   and a pairing code are both unbreakable strings, and on a narrow screen they
+   are the two things most likely to. */
+.device-number,
+.code,
+.summary-row .v {
+  overflow-wrap: anywhere;
+}
+
+/* The code shrinks rather than overflowing: 8 characters at a fixed 30px plus
+   letter-spacing is already close to the width of a small phone's card. */
+@media (max-width: 380px) {
+  .code { font-size: 26px; letter-spacing: 0.08em; }
+  .metric { padding: 8px 6px; }
+  .metric .k { letter-spacing: 0.06em; }
 }

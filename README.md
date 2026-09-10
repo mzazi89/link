@@ -312,6 +312,15 @@ lib/
 would fight. `app/globals.css` is quartzxd's stylesheet verbatim, with every
 addition quarantined below a marked line so the shared parts stay identical.
 
+**One deliberate structural difference from quartzxd's page.** `.ambient` renders
+as an empty sibling, not as the wrapper around the content. It is
+`position: fixed; inset: 0`, so anything nested inside it is taken out of the
+document flow — `<body>` never grows past one viewport and the page cannot be
+scrolled at all. quartzxd nests its content there and gets away with it because
+its page fits on a single screen; this one has two cards and a footer, so it does
+not. Keeping the background as a separate fixed layer preserves the intended
+effect — it stays put while content scrolls over it.
+
 ---
 
 ## Verified

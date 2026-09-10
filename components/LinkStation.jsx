@@ -55,7 +55,21 @@ export default function LinkStation() {
     botOnline === null ? 'BOT —' : botOnline ? 'BOT ONLINE' : 'BOT OFFLINE'
 
   return (
-    <div className="ambient">
+    <>
+      {/* Background layer — and deliberately NOT a wrapper.
+          .ambient is position:fixed with inset:0, so it is pinned to the
+          viewport and taken out of the document flow. Anything nested inside it
+          therefore contributes no height to <body>, the document never grows
+          past one screen, and there is nothing to scroll to. That is why the
+          page would not scroll.
+          quartzxd gets away with nesting its content in here because its page
+          fits on one screen; this one has two cards and a footer, so it does
+          not. Rendering it as an empty sibling keeps the fixed background
+          exactly as designed — it stays put while the content scrolls over it —
+          and lets the document be as tall as it needs to be.
+          pointer-events:none on the class is the giveaway that this was always
+          meant to be decoration. */}
+      <div className="ambient" aria-hidden="true" />
       <div className="wrap">
         <header className="site">
           <a className="brand" href="/">
@@ -112,6 +126,6 @@ export default function LinkStation() {
           </span>
         </footer>
       </div>
-    </div>
+    </>
   )
 }
