@@ -17,7 +17,10 @@ import { COUNTRIES, DEFAULT_COUNTRY_ISO } from '@/lib/countries'
  *   expired / error / blocked → recoverable dead ends
  */
 
-const POLL_WAITING_MS = 2000
+// The bot is woken by a database notification rather than by this poll, so a
+// code typically appears within a second or two. Polling this often is about
+// showing it the moment it exists, not about discovering it.
+const POLL_WAITING_MS = 1200
 // Once the code is on screen we are only watching for the device to connect,
 // so we can back right off and stop hammering the endpoint.
 const POLL_READY_MS = 4000
@@ -219,6 +222,15 @@ export default function Linker() {
   const secondsLeft = request?.expiresAt
     ? Math.ceil((new Date(request.expiresAt).getTime() - now) / 1000)
     : null
+
+  // How long the user has been waiting, and whether anything has actually
+  // touched their request. A request that stays 'pending' is not slow, it is
+  // unconsumed — which points at the bot, not at this page. Saying so beats
+  // leaving someone to watch a spinner and guess.
+  const waitedSeconds = request?.createdAt
+    ? Math.max(0, Math.floor((now - new Date(request.createdAt).getTime()) / 1000))
+    : 0
+  const unconsumed = phase === 'waiting' && botStatus === 'pending' && waitedSeconds >= 15
 
   // A queued request whose window closed should not leave the user watching a
   // spinner. The API closes unclaimed rows out too; this is just the UI keeping
@@ -630,10 +642,20 @@ export default function Linker() {
               />
             </ol>
 
+            {unconsumed ? (
+              <p className="mt-2 border-l-2 border-rust pl-3 text-[12.5px] leading-relaxed text-paper-muted">
+                Nothing has picked up your request yet, which usually means the
+                bot is offline. It stays queued until it expires — leave this page
+                open and it will continue on its own if the bot comes back.
+              </p>
+            ) : null}
+
             <div className="flex items-center justify-between border-t pt-4 hairline">
-              <span className="label">Expires in</span>
+              <span className="label">
+                {unconsumed ? 'Queued for' : 'Expires in'}
+              </span>
               <span className="font-mono text-[12px] text-paper-muted">
-                {formatDuration(secondsLeft)}
+                {formatDuration(unconsumed ? waitedSeconds : secondsLeft)}
               </span>
             </div>
 

@@ -142,6 +142,7 @@ so a deployment with nothing but the connection string behaves correctly.
 | `RATE_LIMIT_IP_MAX` / `RATE_LIMIT_IP_WINDOW_MIN` | no | Per-IP cap (default 5 per 15 min). |
 | `RATE_LIMIT_PHONE_MAX` / `RATE_LIMIT_PHONE_WINDOW_MIN` | no | Per-number cap (default 3 per 60 min). |
 | `LINK_TTL_MINUTES` | no | How long a request stays alive (default 10). |
+| `NOTIFY_CHANNEL` | no | Postgres channel the bot listens on for instant pickup (default `mzazi_device_requests`). Must match the bot's value. |
 | `VERIFY_IP_MAX` / `VERIFY_IP_WINDOW_MIN` | no | Password guesses per IP across all numbers (default 12 per 15 min). |
 | `VERIFY_LOCKOUT_AFTER` / `VERIFY_LOCKOUT_MINUTES` | no | Wrong guesses against one number before it locks (default 5, for 15 min). |
 | `VERIFY_LOG_RETENTION_DAYS` | no | How long `password_attempts` is kept (default 7). |
@@ -294,6 +295,65 @@ curl -X POST -H "x-init-key: <value>" https://<your-deployment>/api/init-db
 the schema is fine and the missing piece is the bot's `listSessions` sync.
 
 A key in a query string lands in access logs, so prefer the header when you use one.
+
+---
+
+## How fast a code appears, and what decides it
+
+The whole budget, end to end:
+
+| Step | Typical | Bounded by |
+|---|---|---|
+| Site inserts the request | ~100ms | a Neon round trip |
+| Bot notices it | **~10ms** | Postgres `NOTIFY` |
+| Bot asks WhatsApp for the code | 2–15s | WhatsApp, not us |
+| Bot writes the code back | ~100ms | a Neon round trip |
+| User's page displays it | ≤1.2s | the client poll |
+
+So what decides whether you wait 5 seconds or 25 is **WhatsApp issuing the code**.
+Everything on this side is sub-second.
+
+### The bot is woken, not polled
+
+Polling puts a floor on latency: a user waits, on average, half an interval before
+a worker even looks at their request. Instead the site sends `pg_notify` the moment
+a row is committed and the bot is `LISTEN`ing for it.
+
+The poll has not gone away — it has been demoted to a safety net for a dropped
+connection. If the listener dies the worker reconnects after 5s, and the poll
+underneath still finds the row, so correctness never rests on a side channel.
+
+That is why the poll interval is adaptive: **2s** while the listener is healthy and
+**1s** when it is not, because then the poll *is* the mechanism.
+
+### One deployment detail that matters
+
+**Point the bot at the direct connection string, not `-pooler`.**
+
+Neon's pooled endpoint runs PgBouncer in transaction mode, which does not preserve
+session state. `LISTEN` there does not error — it silently never delivers, because
+the session that subscribed is not the session that later carries the notify. A
+silent failure is the worst shape, so the worker detects a `-pooler` hostname and
+refuses to depend on it: it logs a warning and falls back to fast polling.
+
+`SELECT pg_notify` from the site is unaffected either way — one statement, no
+session state to lose.
+
+### If a request sits at "waiting for the bot"
+
+That status means `pending`: the row exists and is valid, but nothing has claimed
+it. It is not a latency problem, and no interval tuning will help. Either the
+bot-side worker is not running, or `linkQueue.start()` was never called.
+
+The page says so itself after 15 seconds, and the bot log is the place to confirm:
+
+```
+[linkQueue] listening on mzazi_device_requests — requests picked up immediately
+[linkQueue] claim <ref> [link] → +••••••8399 (attempt 1)
+```
+
+If the first line is missing, the listener did not start. If both are missing, the
+worker is not running.
 
 ---
 

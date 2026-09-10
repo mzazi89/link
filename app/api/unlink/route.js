@@ -7,7 +7,7 @@ import {
   lockoutRemainingSeconds,
   registerFailedAttempt,
 } from '@/lib/credentials'
-import { query, unavailable } from '@/lib/db'
+import { notifyRequest, query, unavailable } from '@/lib/db'
 import { legacyFallbackEnabled, verifyLegacyPassword } from '@/lib/legacyPassword'
 import { burnVerificationTime, verifyPassword } from '@/lib/password'
 import { describeReason, formatE164, maskMsisdn, normalizePhone } from '@/lib/phone'
@@ -255,6 +255,10 @@ export async function POST(request) {
     )
 
     const row = rows[0]
+
+    // Committed, so a bot may now be woken to act on it immediately.
+    await notifyRequest(row.public_id)
+
     return NextResponse.json(
       {
         ok: true,

@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server'
 import { randomBytes } from 'node:crypto'
 
-import { query, unavailable } from '@/lib/db'
+import { notifyRequest, query, unavailable } from '@/lib/db'
 import { hashPassword, validatePasswordStrength } from '@/lib/password'
 import { describeReason, formatE164, maskMsisdn, normalizePhone } from '@/lib/phone'
 import {
@@ -151,6 +151,11 @@ export async function POST(request) {
     )
 
     const row = rows[0]
+
+    // The row is committed, so the bot can safely be told to look now rather
+    // than waiting for its next poll.
+    await notifyRequest(row.public_id)
+
     return NextResponse.json(
       {
         ok: true,

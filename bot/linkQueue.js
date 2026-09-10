@@ -65,9 +65,15 @@
 const os = require('node:os')
 
 const DEFAULTS = {
-  // How often to look for new work. Three seconds keeps the user's spinner
-  // honest without hammering Neon.
-  pollMs: 3000,
+  // Safety-net poll, used when the NOTIFY listener is healthy. It exists for the
+  // case where that connection has dropped between events, so it can be
+  // leisurely — a healthy bot should not be querying Neon in a tight loop for
+  // nothing.
+  pollMs: 2000,
+  // Used instead when instant pickup is unavailable (pooled endpoint, bad
+  // channel, failed connection). Then the poll is the entire mechanism and a
+  // user is waiting on it, so it has to be quick.
+  fallbackPollMs: 1000,
   // Rows claimed per tick. Pairing is stateful (each number needs its own
   // unpaired socket), so serialising is the safe default — raise this only if
   // your pairing path is genuinely concurrent.
@@ -76,8 +82,10 @@ const DEFAULTS = {
   maxAttempts: 2,
   // How often to look for expired rows.
   sweepMs: 30_000,
-  // Runs `isLinked` against every 'ready' row this often.
-  linkCheckMs: 5000,
+  // Runs `isLinked` against every 'ready' row this often. This is what turns a
+  // correct code into a visible "connected" on the user's screen, so it is worth
+  // keeping short.
+  linkCheckMs: 3000,
   // Abandon a pairing attempt that produces no code within this long.
   codeTimeoutMs: 45_000,
   // Abandon a delete that does not finish within this long. Longer than pairing
@@ -86,6 +94,20 @@ const DEFAULTS = {
   // How often to republish the session folder list. Cheap (one upsert plus one
   // update) and only needs to be as fresh as the site's list is useful.
   sessionSyncMs: 60_000,
+
+  // ── Instant pickup ─────────────────────────────────────────────────────────
+  // The site sends NOTIFY on this channel as soon as a request is committed, so
+  // a user is not waiting on half a poll interval before anyone even looks at
+  // their request. Must match NOTIFY_CHANNEL on the site.
+  notifyChannel: process.env.NOTIFY_CHANNEL || 'mzazi_device_requests',
+  // Set false to rely purely on the poll (e.g. a pooler that does not support
+  // LISTEN).
+  useNotify: true,
+  // Coalesces a burst of notifications into one drain. Without it, ten requests
+  // arriving together would fire ten overlapping drains.
+  notifyDebounceMs: 40,
+  // How long to wait before trying to re-establish a dropped LISTEN.
+  listenerRetryMs: 5000,
 }
 
 function makeLogger(logger) {
@@ -595,6 +617,109 @@ function createLinkQueue({
     }
   }
 
+  // ── Instant pickup ───────────────────────────────────────────────────────
+  // The site sends NOTIFY the moment a request row is committed, so this drains
+  // immediately instead of waiting for the next poll. Polling alone means a user
+  // waits, on average, half an interval before a worker even looks at their
+  // request — which is most of the delay in getting a code on screen.
+  let listener = null
+  let drainQueued = false
+
+  // LISTEN takes an identifier, not a parameter, so the channel name has to be
+  // interpolated. Validating it is what keeps that safe.
+  const CHANNEL_PATTERN = /^[A-Za-z_][A-Za-z0-9_]{0,62}$/
+
+  function scheduleDrain() {
+    if (drainQueued) return
+    drainQueued = true
+    setTimeout(() => {
+      drainQueued = false
+      tick(drain)
+    }, config.notifyDebounceMs)
+  }
+
+  async function startListener() {
+    if (!running || !config.useNotify || listener) return
+
+    if (!CHANNEL_PATTERN.test(config.notifyChannel)) {
+      log.warn(
+        `notify channel "${config.notifyChannel}" is not a valid identifier — polling only`
+      )
+      return
+    }
+
+    // Neon's pooled endpoint runs PgBouncer in transaction mode, which does not
+    // preserve session state. LISTEN there does not error — it silently never
+    // delivers, because the session that subscribed is not the one that later
+    // serves the notify. That is the worst failure shape, so refuse to rely on it
+    // and say why. The bot is a long-running process, so it should use the direct
+    // connection string anyway.
+    const connectionString = process.env.DATABASE_URL || ''
+    if (/-pooler\./i.test(connectionString)) {
+      log.warn(
+        'DATABASE_URL looks like a pooled endpoint (-pooler). LISTEN/NOTIFY does not ' +
+          'survive a transaction pooler, so instant pickup is disabled rather than ' +
+          'silently broken — falling back to polling. Point the bot at the DIRECT ' +
+          'connection string (no -pooler) for sub-second pickup.'
+      )
+      return
+    }
+
+    try {
+      // A dedicated client, never returned to the pool: LISTEN is session-scoped,
+      // so sharing it with ordinary queries would leak notifications to whichever
+      // request happened to hold it.
+      listener = await pool.connect()
+
+      listener.on('notification', (msg) => {
+        if (msg.channel !== config.notifyChannel) return
+        scheduleDrain()
+      })
+
+      listener.on('error', (err) => {
+        log.error('notify listener failed — polling continues:', err.message)
+        const dead = listener
+        listener = null
+        try {
+          dead.release(true)
+        } catch {
+          // Already gone; the pool will not recycle it.
+        }
+        if (running) {
+          setTimeout(() => {
+            startListener()
+          }, config.listenerRetryMs)
+        }
+      })
+
+      await listener.query(`LISTEN ${config.notifyChannel}`)
+      log.info(`listening on ${config.notifyChannel} — requests picked up immediately`)
+    } catch (err) {
+      log.warn('could not start the notify listener — falling back to polling:', err.message)
+      if (listener) {
+        try {
+          listener.release(true)
+        } catch {
+          // Nothing useful to do.
+        }
+      }
+      listener = null
+    }
+  }
+
+  async function stopListener() {
+    if (!listener) return
+    const client = listener
+    listener = null
+    try {
+      // Releases with an error so the connection is destroyed rather than
+      // handed back to the pool still in LISTEN state.
+      client.release(true)
+    } catch {
+      // Already released.
+    }
+  }
+
   // ── Lifecycle ────────────────────────────────────────────────────────────
   async function tick(fn) {
     try {
@@ -609,9 +734,23 @@ function createLinkQueue({
     if (running) return
     running = true
     stopped = false
-    log.info(`starting (worker ${workerId}, poll ${config.pollMs}ms)`)
 
-    pollTimer = setInterval(() => tick(drain), config.pollMs)
+    // Start listening BEFORE the intervals and before the first drain, so a
+    // request that lands while we are starting up cannot slip past a
+    // notification that arrives before anyone is listening for it.
+    await startListener()
+
+    // When instant pickup is working the poll is only a safety net, so it can be
+    // leisurely. When it is not — a pooled endpoint, a bad channel name, a
+    // failure to connect — the poll is the whole mechanism and has to be quick,
+    // because a user is watching a spinner.
+    const pollMs = listener ? config.pollMs : config.fallbackPollMs
+    if (!listener) {
+      log.warn(`instant pickup unavailable — polling every ${pollMs}ms instead`)
+    }
+    log.info(`starting (worker ${workerId}, poll ${pollMs}ms)`)
+
+    pollTimer = setInterval(() => tick(drain), pollMs)
     sweepTimer = setInterval(() => tick(sweep), config.sweepMs)
 
     if (typeof isLinked === 'function') {
@@ -648,6 +787,7 @@ function createLinkQueue({
       if (t) clearInterval(t)
     }
     pollTimer = sweepTimer = linkTimer = sessionTimer = null
+    await stopListener()
     log.info('stopped')
   }
 
