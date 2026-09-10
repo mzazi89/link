@@ -128,18 +128,22 @@ deploy.
 
 ### Environment
 
+**Only `DATABASE_URL` is required.** Every other variable has a working default,
+so a deployment with nothing but the connection string behaves correctly.
+
 | Variable | Required | Description |
 |---|---|---|
-| `DATABASE_URL` | yes | Neon connection string, shared with the bot and both panels. |
-| `NEXT_PUBLIC_BASE_URL` | yes | Public URL of this deployment. |
+| `DATABASE_URL` | **yes** | Neon connection string, shared with the bot and both panels. |
+| `NEXT_PUBLIC_BASE_URL` | no | Derived from `VERCEL_PROJECT_PRODUCTION_URL` (or `VERCEL_URL` for previews), falling back to localhost. Set only to force a custom domain. |
+| `INIT_DB_KEY` | no | Needed only to **re-run** `/api/init-db` once the schema exists. The first run needs no key. |
+| `LEGACY_DEFAULT_PASSWORDS` | no | Primary passwords for numbers that have none (default `1234,0000`). Empty disables the fallback. |
 | `RATE_LIMIT_IP_MAX` / `RATE_LIMIT_IP_WINDOW_MIN` | no | Per-IP cap (default 5 per 15 min). |
 | `RATE_LIMIT_PHONE_MAX` / `RATE_LIMIT_PHONE_WINDOW_MIN` | no | Per-number cap (default 3 per 60 min). |
 | `LINK_TTL_MINUTES` | no | How long a request stays alive (default 10). |
-| `VERIFY_IP_MAX` / `VERIFY_IP_WINDOW_MIN` | no | Password guesses allowed per IP across all numbers (default 12 per 15 min). |
+| `VERIFY_IP_MAX` / `VERIFY_IP_WINDOW_MIN` | no | Password guesses per IP across all numbers (default 12 per 15 min). |
 | `VERIFY_LOCKOUT_AFTER` / `VERIFY_LOCKOUT_MINUTES` | no | Wrong guesses against one number before it locks (default 5, for 15 min). |
 | `VERIFY_LOG_RETENTION_DAYS` | no | How long `password_attempts` is kept (default 7). |
-| `LEGACY_DEFAULT_PASSWORDS` | **yes** | Comma-separated primary passwords accepted for numbers that have none (default `1234,0000`). Empty disables the fallback. |
-| `IP_HASH_SALT` | recommended | Salt for hashing caller IPs before storage. |
+| `IP_HASH_SALT` | no | Salt for hashing caller IPs. Unset, it is derived from `DATABASE_URL` — stable across instances, so the per-IP throttle stays correct. Set it only to rotate the salt. |
 | `PGSSL_STRICT` | no | Set to `1` to enforce full TLS chain verification. |
 
 ---
@@ -260,21 +264,33 @@ you hunting for a bug in the wrong place.
 
 Two ways to apply it:
 
-```bash
-# 1. Locally, against the production database
-DATABASE_URL="postgresql://..." npm run db:init
+```
+# 1. From the deployment. No key is needed while the schema is missing, so with
+#    nothing but DATABASE_URL configured, just open this in a browser:
+https://<your-deployment>/api/init-db
 
-# 2. From the deployment itself, if you cannot run scripts locally.
-#    Set INIT_DB_KEY on the deployment first, then:
+# 2. Locally, against the production database
+DATABASE_URL="postgresql://..." npm run db:init
+```
+
+Once the tables exist, `/api/init-db` refuses unauthenticated calls, so re-running
+it later — an upgrade, or a repair — needs `INIT_DB_KEY`:
+
+```
 curl -X POST -H "x-init-key: <value>" https://<your-deployment>/api/init-db
 ```
 
-Both are idempotent and report a per-table row count afterwards. Read that output
-rather than assuming: if it succeeds but `bot_sessions` is 0, the schema is fine
-and the missing piece is the bot's `listSessions` sync.
+That asymmetry is deliberate. Bootstrapping an empty database is safe enough to
+leave unauthenticated: the script is purely additive, never drops a table or a
+row, and running it first gains an attacker nothing. A live database, on the other
+hand, should never expose an open DDL endpoint. It also means you can get started
+with `DATABASE_URL` as the only variable you set.
 
-`GET /api/init-db` also works with `?key=` so you can trigger it from a phone
-browser, but a key in a URL ends up in access logs — prefer the header.
+Both routes finish with a per-table row count. **Read that output rather than
+assuming**: if it succeeds but `bot_sessions` is 0, the schema is fine and the
+missing piece is the bot's `listSessions` sync.
+
+A key in a query string lands in access logs, so prefer the header when you use one.
 
 ---
 

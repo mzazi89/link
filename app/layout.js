@@ -1,6 +1,24 @@
 import './globals.css'
 
-const baseUrl = process.env.NEXT_PUBLIC_BASE_URL || 'http://localhost:3000'
+/**
+ * Absolute URL used for metadata (canonical links, Open Graph).
+ *
+ * Resolved from the platform rather than demanded as configuration, so that
+ * DATABASE_URL can be the only variable you actually have to set. Order:
+ *
+ *   NEXT_PUBLIC_BASE_URL           explicit override, e.g. a custom domain
+ *   VERCEL_PROJECT_PRODUCTION_URL  the stable production domain
+ *   VERCEL_URL                     this deployment (right for previews)
+ *   localhost
+ */
+function resolveBaseUrl() {
+  if (process.env.NEXT_PUBLIC_BASE_URL) return process.env.NEXT_PUBLIC_BASE_URL
+  const host = process.env.VERCEL_PROJECT_PRODUCTION_URL || process.env.VERCEL_URL
+  if (host) return `https://${host}`
+  return 'http://localhost:3000'
+}
+
+const baseUrl = resolveBaseUrl()
 
 export const metadata = {
   metadataBase: new URL(baseUrl),

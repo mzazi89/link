@@ -4,7 +4,7 @@ import path from 'node:path'
 
 import { NextResponse } from 'next/server'
 
-import { applySchema, query } from '@/lib/db'
+import { applySchema, query, schemaExists } from '@/lib/db'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
@@ -14,6 +14,10 @@ const NO_STORE = { 'Cache-Control': 'no-store' }
 /**
  * Apply lib/schema.sql to the configured database.
  *
+ *   # empty database — no key needed, so DATABASE_URL can be the only var
+ *   curl -X POST https://your-deployment/api/init-db
+ *
+ *   # once the schema exists, re-running it needs the key
  *   curl -X POST -H "x-init-key: $INIT_DB_KEY" https://your-deployment/api/init-db
  *
  * ── Why this exists ──────────────────────────────────────────────────────────
@@ -27,14 +31,18 @@ const NO_STORE = { 'Cache-Control': 'no-store' }
  *
  * ── Safety ───────────────────────────────────────────────────────────────────
  *
- * Requires INIT_DB_KEY to be set on the deployment, and refuses when it is not —
- * failing closed, so forgetting to configure it can never leave this open. The
- * key is compared in constant time.
+ * Two modes, decided by whether the schema is already there:
+ *
+ *   missing → allowed with no configuration at all. Creating empty tables from
+ *             an additive script gives an attacker nothing, and demanding a key
+ *             just to bootstrap is friction with no security benefit. This is
+ *             what lets DATABASE_URL be the only variable you have to set.
+ *   present → requires INIT_DB_KEY, compared in constant time, so a live
+ *             database never has an open DDL endpoint.
  *
  * The schema is purely additive: CREATE TABLE IF NOT EXISTS, ALTER TABLE ADD
- * COLUMN IF NOT EXISTS, and view/index replacement. It never drops a table or a
- * row, so even a leaked key cannot destroy data. It can only bring the database
- * up to the shape the code expects.
+ * COLUMN IF NOT EXISTS, CREATE OR REPLACE VIEW, CREATE INDEX IF NOT EXISTS. It
+ * never drops a table or a row, so even a leaked key cannot destroy data.
  */
 
 // Hardcoded, so nothing here is interpolated from user input.
@@ -50,29 +58,59 @@ function sameKey(a, b) {
 }
 
 async function run(request) {
-  const configured = process.env.INIT_DB_KEY
-  if (!configured) {
+  const configured = process.env.INIT_DB_KEY || ''
+  const url = new URL(request.url)
+  // Header preferred — a key in a query string ends up in access logs.
+  const supplied = request.headers.get('x-init-key') || url.searchParams.get('key') || ''
+
+  let present
+  try {
+    present = await schemaExists()
+  } catch (err) {
+    console.error('[link][init-db] could not reach the database:', err.message)
     return NextResponse.json(
       {
         ok: false,
-        error: 'not_enabled',
-        message:
-          'Set INIT_DB_KEY on this deployment to enable schema initialisation, or ' +
-          'run `npm run db:init` locally instead.',
+        error: 'unavailable',
+        message: `Could not reach the database: ${err.message}`,
       },
       { status: 503, headers: NO_STORE }
     )
   }
 
-  const url = new URL(request.url)
-  // Header preferred — a key in a query string ends up in access logs.
-  const supplied = request.headers.get('x-init-key') || url.searchParams.get('key') || ''
+  let bootstrapped = false
 
-  if (!sameKey(supplied, configured)) {
-    console.warn('[link][init-db] rejected: bad or missing key')
+  if (configured) {
+    if (!sameKey(supplied, configured)) {
+      console.warn('[link][init-db] rejected: bad or missing key')
+      return NextResponse.json(
+        { ok: false, error: 'forbidden', message: 'Missing or incorrect INIT_DB_KEY.' },
+        { status: 403, headers: NO_STORE }
+      )
+    }
+  } else if (present) {
+    // The schema is already there, so this is a maintenance re-run rather than a
+    // bootstrap. Without a key configured we refuse, so that "forgot to set the
+    // key" can never leave a permanently open DDL endpoint on a live database.
     return NextResponse.json(
-      { ok: false, error: 'forbidden', message: 'Missing or incorrect INIT_DB_KEY.' },
+      {
+        ok: false,
+        error: 'key_required',
+        message:
+          'The schema already exists, so re-running it needs authorisation. Set ' +
+          'INIT_DB_KEY on this deployment, or use `npm run db:init` locally.',
+      },
       { status: 403, headers: NO_STORE }
+    )
+  } else {
+    // Bootstrapping an empty database. Deliberately allowed with no configuration
+    // at all, because requiring a key to create the tables is friction with no
+    // security benefit: the script is purely additive, it drops no table and no
+    // row, and running it first gives an attacker nothing they could not get by
+    // waiting. It also means DATABASE_URL can be the only variable you set.
+    bootstrapped = true
+    console.warn(
+      '[link][init-db] bootstrapping an empty database with no INIT_DB_KEY configured'
     )
   }
 
@@ -126,11 +164,15 @@ async function run(request) {
     {
       ok: true,
       applied: true,
+      bootstrapped,
       databaseHost: host || null,
       tables,
-      note:
-        'Idempotent — safe to run again. The connected-numbers list stays empty ' +
-        'until the bot syncs its session folders.',
+      note: bootstrapped
+        ? 'Bootstrapped an empty database with no key configured. Re-running it ' +
+          'later will need INIT_DB_KEY. The connected-numbers list stays empty ' +
+          'until the bot syncs its session folders.'
+        : 'Idempotent — safe to run again. The connected-numbers list stays empty ' +
+          'until the bot syncs its session folders.',
     },
     { headers: NO_STORE }
   )

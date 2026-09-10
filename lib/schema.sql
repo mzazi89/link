@@ -216,9 +216,16 @@ CREATE INDEX IF NOT EXISTS bot_sessions_active_idx
   WHERE removed_at IS NULL;
 
 -- ── Operator views ───────────────────────────────────────────────────────────
+-- The legacy view name from the first version of this schema. Dropped because we
+-- genuinely want it gone, not because it is being replaced.
 DROP VIEW IF EXISTS link_requests_live;
-DROP VIEW IF EXISTS device_requests_live;
-CREATE VIEW device_requests_live AS
+
+-- Everything below uses CREATE OR REPLACE rather than DROP + CREATE. This script
+-- can now be run against a live database (see /api/init-db), and dropping a view
+-- opens a window where anything reading it fails. CREATE OR REPLACE has one
+-- constraint worth knowing: it cannot change a view's column names, types or
+-- order. If you ever need to reshape one of these, drop it by hand first.
+CREATE OR REPLACE VIEW device_requests_live AS
 SELECT
   public_id,
   action,
@@ -233,8 +240,7 @@ FROM device_requests
 WHERE status IN ('pending', 'processing', 'ready')
 ORDER BY created_at DESC;
 
-DROP VIEW IF EXISTS device_credentials_summary;
-CREATE VIEW device_credentials_summary AS
+CREATE OR REPLACE VIEW device_credentials_summary AS
 SELECT
   phone,
   created_at,
@@ -248,8 +254,7 @@ ORDER BY created_at DESC;
 -- Every session the bot currently holds, and whether it has a real password.
 -- has_password = false is the set that falls back to the primary password, so
 -- this is the list to work through when tightening security later.
-DROP VIEW IF EXISTS bot_sessions_active;
-CREATE VIEW bot_sessions_active AS
+CREATE OR REPLACE VIEW bot_sessions_active AS
 SELECT
   s.phone,
   s.first_seen_at,
