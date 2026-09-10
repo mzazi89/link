@@ -56,10 +56,32 @@ const pool = new Pool({
   ssl: wantsSsl ? { rejectUnauthorized: process.env.PGSSL_STRICT === '1' } : undefined,
 })
 
+// Kept in step with the tables lib/schema.sql creates. Reporting on a table that
+// no longer exists would make this script fail AFTER successfully applying the
+// schema, which is the most misleading outcome possible — it looks like the
+// apply failed when it did not.
+const TABLES = ['device_requests', 'device_credentials', 'password_attempts', 'bot_sessions']
+
+const host = connectionString.replace(/^.*@/, '').replace(/[/?].*$/, '')
+
 try {
   await pool.query(sql)
-  const { rows } = await pool.query('SELECT count(*)::int AS n FROM link_requests')
-  console.log('[db:init] schema applied — link_requests holds', rows[0].n, 'row(s)')
+  console.log(`[db:init] schema applied to ${host || '(unknown host)'}`)
+
+  for (const table of TABLES) {
+    try {
+      const { rows } = await pool.query(`SELECT count(*)::int AS n FROM ${table}`)
+      console.log(`[db:init]   ${table.padEnd(20)} ${rows[0].n} row(s)`)
+    } catch (err) {
+      console.error(`[db:init]   ${table.padEnd(20)} MISSING — ${err.message}`)
+      process.exitCode = 1
+    }
+  }
+
+  console.log(
+    '[db:init] idempotent, so re-running is always safe. The connected-numbers\n' +
+      '          list stays empty until the bot syncs its session folders.'
+  )
 } catch (err) {
   console.error('[db:init] failed:', err.message)
   process.exitCode = 1

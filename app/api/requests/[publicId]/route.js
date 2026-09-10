@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 
-import { query } from '@/lib/db'
+import { query, unavailable } from '@/lib/db'
 import { formatPairingCode } from '@/lib/pairingCode'
 import { formatE164 } from '@/lib/phone'
 
@@ -49,10 +49,10 @@ export async function GET(_request, { params }) {
     row = result.rows[0]
   } catch (err) {
     console.error('[link][status] lookup failed:', err.message)
-    return NextResponse.json(
-      { ok: false, error: 'unavailable' },
-      { status: 503, headers: NO_STORE }
-    )
+    return NextResponse.json(unavailable(err, 'Could not read that request.'), {
+      status: 503,
+      headers: NO_STORE,
+    })
   }
 
   if (!row) {

@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server'
 import { randomBytes } from 'node:crypto'
 
-import { query } from '@/lib/db'
+import { query, unavailable } from '@/lib/db'
 import { hashPassword, validatePasswordStrength } from '@/lib/password'
 import { describeReason, formatE164, maskMsisdn, normalizePhone } from '@/lib/phone'
 import {
@@ -89,11 +89,7 @@ export async function POST(request) {
     // queue work for the bot — an outage must not become an open door.
     console.error('[link][api] rate limit check failed:', err.message)
     return NextResponse.json(
-      {
-        ok: false,
-        error: 'unavailable',
-        message: 'Linking is temporarily unavailable. Please try again shortly.',
-      },
+      unavailable(err, 'Linking is temporarily unavailable. Please try again shortly.'),
       { status: 503, headers: NO_STORE }
     )
   }
@@ -172,11 +168,7 @@ export async function POST(request) {
   } catch (err) {
     console.error('[link][api] insert failed:', err.message)
     return NextResponse.json(
-      {
-        ok: false,
-        error: 'unavailable',
-        message: 'Could not queue your request. Please try again shortly.',
-      },
+      unavailable(err, 'Could not queue your request. Please try again shortly.'),
       { status: 503, headers: NO_STORE }
     )
   }

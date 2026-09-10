@@ -243,6 +243,39 @@ Security headers and `Cache-Control: no-store` on `/api/*` are set in
 `next.config.js` — a cached "ready" response would hand someone a code that has
 already rotated.
 
+### First deploy: the schema does not apply itself
+
+Deploying the code and initialising the database are two separate acts. Doing the
+first without the second is the most common way to end up with a site that
+returns 503 for everything, and the log line is unmistakable:
+
+```
+[link][connected] lookup failed: relation "bot_sessions" does not exist
+[link][api] rate limit check failed: relation "device_requests" does not exist
+```
+
+The API now detects this (Postgres `42P01`) and answers with
+`error: "schema_missing"` plus the actual fix, rather than a vague 503 that sends
+you hunting for a bug in the wrong place.
+
+Two ways to apply it:
+
+```bash
+# 1. Locally, against the production database
+DATABASE_URL="postgresql://..." npm run db:init
+
+# 2. From the deployment itself, if you cannot run scripts locally.
+#    Set INIT_DB_KEY on the deployment first, then:
+curl -X POST -H "x-init-key: <value>" https://<your-deployment>/api/init-db
+```
+
+Both are idempotent and report a per-table row count afterwards. Read that output
+rather than assuming: if it succeeds but `bot_sessions` is 0, the schema is fine
+and the missing piece is the bot's `listSessions` sync.
+
+`GET /api/init-db` also works with `?key=` so you can trigger it from a phone
+browser, but a key in a URL ends up in access logs — prefer the header.
+
 ---
 
 ## Passwords and removal

@@ -3,6 +3,17 @@ const nextConfig = {
   reactStrictMode: true,
   poweredByHeader: false,
 
+  experimental: {
+    // /api/init-db reads lib/schema.sql at runtime with a path built from
+    // process.cwd(). Next's file tracing cannot follow that statically, so
+    // without this the file is left out of the serverless bundle and the
+    // endpoint fails with ENOENT in production only — the worst place to find
+    // out.
+    outputFileTracingIncludes: {
+      '/api/init-db': ['./lib/schema.sql'],
+    },
+  },
+
   async headers() {
     return [
       {

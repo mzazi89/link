@@ -7,7 +7,7 @@ import {
   lockoutRemainingSeconds,
   registerFailedAttempt,
 } from '@/lib/credentials'
-import { query } from '@/lib/db'
+import { query, unavailable } from '@/lib/db'
 import { legacyFallbackEnabled, verifyLegacyPassword } from '@/lib/legacyPassword'
 import { burnVerificationTime, verifyPassword } from '@/lib/password'
 import { describeReason, formatE164, maskMsisdn, normalizePhone } from '@/lib/phone'
@@ -116,11 +116,7 @@ export async function POST(request) {
   } catch (err) {
     console.error('[link][unlink] throttle check failed:', err.message)
     return NextResponse.json(
-      {
-        ok: false,
-        error: 'unavailable',
-        message: 'Removal is temporarily unavailable. Please try again shortly.',
-      },
+      unavailable(err, 'Removal is temporarily unavailable. Please try again shortly.'),
       { status: 503, headers: NO_STORE }
     )
   }
@@ -140,7 +136,7 @@ export async function POST(request) {
   } catch (err) {
     console.error('[link][unlink] credential lookup failed:', err.message)
     return NextResponse.json(
-      { ok: false, error: 'unavailable', message: 'Removal is temporarily unavailable.' },
+      unavailable(err, 'Removal is temporarily unavailable.'),
       { status: 503, headers: NO_STORE }
     )
   }
@@ -198,10 +194,10 @@ export async function POST(request) {
       session = await findActiveSession(msisdn)
     } catch (err) {
       console.error('[link][unlink] session lookup failed:', err.message)
-      return NextResponse.json(
-        { ok: false, error: 'unavailable', message: 'Removal is temporarily unavailable.' },
-        { status: 503, headers: NO_STORE }
-      )
+      return NextResponse.json(unavailable(err, 'Removal is temporarily unavailable.'), {
+        status: 503,
+        headers: NO_STORE,
+      })
     }
 
     if (!session || !legacyFallbackEnabled()) {
@@ -277,11 +273,7 @@ export async function POST(request) {
   } catch (err) {
     console.error('[link][unlink] insert failed:', err.message)
     return NextResponse.json(
-      {
-        ok: false,
-        error: 'unavailable',
-        message: 'Could not queue the removal. Please try again shortly.',
-      },
+      unavailable(err, 'Could not queue the removal. Please try again shortly.'),
       { status: 503, headers: NO_STORE }
     )
   }

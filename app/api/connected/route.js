@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server'
 
+import { unavailable } from '@/lib/db'
 import { maskForDisplay } from '@/lib/phone'
 import { listActiveSessions, sessionKey } from '@/lib/sessions'
 
@@ -48,10 +49,10 @@ export async function GET() {
     )
   } catch (err) {
     console.error('[link][connected] lookup failed:', err.message)
-    return NextResponse.json(
-      { ok: false, error: 'unavailable', message: 'Could not load connected numbers.' },
-      { status: 503, headers: NO_STORE }
-    )
+    return NextResponse.json(unavailable(err, 'Could not load connected numbers.'), {
+      status: 503,
+      headers: NO_STORE,
+    })
   }
 }
 

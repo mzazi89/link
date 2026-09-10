@@ -197,7 +197,13 @@ function createLinkQueue({
           WHERE status = 'pending'
             AND expires_at > now()
             AND attempts < $2
-          ORDER BY created_at
+          -- id breaks created_at ties. now() is the TRANSACTION timestamp, so
+          -- several rows inserted together share it exactly, and without a
+          -- tiebreaker Postgres returns them in an arbitrary order — verified
+          -- against a real Postgres, where a delete queued after a link came
+          -- back first. Ordering is not load-bearing here, but a queue that
+          -- cannot promise FIFO on same-timestamp rows is a bad habit to keep.
+          ORDER BY created_at, id
             FOR UPDATE SKIP LOCKED
           LIMIT 1
        )
