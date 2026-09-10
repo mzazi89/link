@@ -2,13 +2,20 @@
 
 /**
  * ─────────────────────────────────────────────────────────────────────────────
- * linkQueue — the quartz side of the linking contract.
+ * linkQueue — the quartz side of the device-request contract.
  * ─────────────────────────────────────────────────────────────────────────────
  *
  * The public site never talks to the bot directly. It writes a row into
- * `link_requests` in the shared Neon database; this module picks that row up,
- * asks WhatsApp for a pairing code, writes the code back, and later confirms the
- * device connected.
+ * `device_requests` in the shared Neon database; this module picks that row up,
+ * does the work, and writes the outcome back.
+ *
+ * Two kinds of job travel through the one queue, distinguished by `action`:
+ *
+ *   link   → ask WhatsApp for a pairing code, publish it, then confirm the
+ *            device connected and promote the user's password into
+ *            device_credentials
+ *   delete → wipe the session (authorised by the site AFTER it verified the
+ *            password, so nothing here needs to know about passwords)
  *
  * Drop this file into the quartz repo (e.g. `lib/linkQueue.js`) and start it
  * from `index.js` once the bots are up:
@@ -26,22 +33,28 @@
  *       return await sock.requestPairingCode(msisdn)
  *     },
  *     isLinked: async (msisdn) => sessionExists(msisdn) && isConnected(msisdn),
+ *
+ *     // Required for the delete flow. Mirror the existing semantics: unlink
+ *     // logs the device out, delete then removes the session folder.
+ *     deleteDevice: async (msisdn) => {
+ *       await logoutSession(msisdn)
+ *       await rmSessionFolder(msisdn)
+ *     },
  *   })
  *
  *   await linkQueue.start()
  *
- * ── Why the two hooks instead of a direct Baileys call ───────────────────────
+ * ── Why the hooks instead of direct Baileys calls ────────────────────────────
  *
- * `generatePairingCode` and `isLinked` are injected because only quartz knows
- * how its socket layer is wired — `whatsapp.js` builds sockets differently for
- * Telegram-sourced and WhatsApp-sourced sessions, and the MZAZIBOT fork adds its
- * own connection hooks. Guessing that here would be a guess baked into two
- * repos. The queue mechanics below are the part that must be exactly right, so
- * that is what this module owns.
+ * `generatePairingCode`, `isLinked` and `deleteDevice` are injected because only
+ * quartz knows how its socket layer is wired — `whatsapp.js` builds sockets
+ * differently for Telegram-sourced and WhatsApp-sourced sessions, and the
+ * MZAZIBOT fork adds its own connection hooks. Guessing that here would be a
+ * guess baked into two repos. The queue mechanics below are the part that must
+ * be exactly right, so that is what this module owns.
  */
 
 const os = require('node:os')
-const { randomUUID } = require('node:crypto')
 
 const DEFAULTS = {
   // How often to look for new work. Three seconds keeps the user's spinner
@@ -59,6 +72,9 @@ const DEFAULTS = {
   linkCheckMs: 5000,
   // Abandon a pairing attempt that produces no code within this long.
   codeTimeoutMs: 45_000,
+  // Abandon a delete that does not finish within this long. Longer than pairing
+  // because a logout can wait on a socket handshake.
+  deleteTimeoutMs: 60_000,
 }
 
 function makeLogger(logger) {
@@ -99,8 +115,12 @@ function withTimeout(promise, ms, label) {
  *   normalisation, so `"ABCD-EFGH"` and `"abcdefgh"` are both fine.
  * @param {(msisdn: string) => Promise<boolean>} [options.isLinked]
  *   Optional. Returns true once the device has actually connected. Without it
- *   the queue stops at 'ready' and the UI never shows the success state, so
- *   supply it if you can.
+ *   the queue stops at 'ready', the user's password is never promoted, and the
+ *   UI never shows the success state — so supply it.
+ * @param {(msisdn: string) => Promise<void>} [options.deleteDevice]
+ *   Required to serve delete requests. Should log the device out and remove its
+ *   session folder. Must reject if the wipe genuinely failed, so the row is
+ *   retried rather than reported as done.
  * @param {(msisdn: string) => Promise<void>} [options.onLinked]
  *   Optional side effect when a device connects — record the session row,
  *   credit a referrer, notify the user, etc.
@@ -111,6 +131,7 @@ function createLinkQueue({
   pool,
   generatePairingCode,
   isLinked,
+  deleteDevice,
   onLinked,
   logger,
   options,
@@ -130,19 +151,23 @@ function createLinkQueue({
   let sweepTimer = null
   let linkTimer = null
 
-  // Rows this worker is actively pairing. The sweeper must not expire these —
-  // doing so would race the pairing attempt and produce a row whose status
-  // contradicts what the socket is doing.
+  // Rows this worker is actively handling. The sweeper must not expire these —
+  // doing so would race the attempt and produce a row whose status contradicts
+  // what the socket is doing.
   const inFlight = new Set()
 
   // ── Claim ────────────────────────────────────────────────────────────────
   // The classic Postgres job-queue idiom: the inner SELECT takes a row lock and
   // SKIP LOCKED makes concurrent workers step over rows another worker holds,
-  // so two bot instances never pair the same number.
+  // so two bot instances never work the same row.
+  //
+  // Deliberately no `action` filter: both link and delete jobs are drained by
+  // the same loop, and deletes are cheap, so letting them queue behind pairing
+  // work costs nothing.
   async function claimNext() {
     const { rows } = await pool.query(
       `
-      UPDATE link_requests
+      UPDATE device_requests
          SET status      = 'processing',
              attempts    = attempts + 1,
              claimed_at  = now(),
@@ -150,7 +175,7 @@ function createLinkQueue({
              updated_at  = now()
        WHERE id = (
          SELECT id
-           FROM link_requests
+           FROM device_requests
           WHERE status = 'pending'
             AND expires_at > now()
             AND attempts < $2
@@ -158,7 +183,7 @@ function createLinkQueue({
             FOR UPDATE SKIP LOCKED
           LIMIT 1
        )
-      RETURNING id, public_id, phone, dial_code, attempts, expires_at
+      RETURNING id, public_id, action, phone, dial_code, attempts, expires_at
       `,
       [workerId, config.maxAttempts]
     )
@@ -168,7 +193,7 @@ function createLinkQueue({
   async function markReady(row, code) {
     await pool.query(
       `
-      UPDATE link_requests
+      UPDATE device_requests
          SET status        = 'ready',
              pairing_code  = $2,
              code_ready_at = now(),
@@ -183,12 +208,27 @@ function createLinkQueue({
   async function markLinked(id) {
     const { rowCount } = await pool.query(
       `
-      UPDATE link_requests
+      UPDATE device_requests
          SET status     = 'linked',
              linked_at  = now(),
              error      = NULL,
              updated_at = now()
        WHERE id = $1 AND status IN ('ready', 'processing')
+      `,
+      [id]
+    )
+    return rowCount > 0
+  }
+
+  async function markCompleted(id) {
+    const { rowCount } = await pool.query(
+      `
+      UPDATE device_requests
+         SET status       = 'completed',
+             completed_at = now(),
+             error        = NULL,
+             updated_at   = now()
+       WHERE id = $1 AND status = 'processing'
       `,
       [id]
     )
@@ -204,7 +244,7 @@ function createLinkQueue({
     const willRetry = row.attempts < config.maxAttempts
     await pool.query(
       `
-      UPDATE link_requests
+      UPDATE device_requests
          SET status       = CASE WHEN attempts >= $3 THEN 'failed' ELSE 'pending' END,
              error        = $2,
              pairing_code = NULL,
@@ -213,36 +253,107 @@ function createLinkQueue({
              updated_at   = now()
        WHERE id = $1 AND status = 'processing'
       `,
-      [row.id, String(message || 'Pairing failed').slice(0, 500), config.maxAttempts]
+      [row.id, String(message || 'Request failed').slice(0, 500), config.maxAttempts]
     )
     return !willRetry
   }
 
-  // ── Work ─────────────────────────────────────────────────────────────────
-  async function processRow(row) {
-    inFlight.add(row.id)
-    log.info(`claim ${row.public_id} → +${mask(row.phone)} (attempt ${row.attempts})`)
-
+  /**
+   * Promote the password staged on a link request into the credential store.
+   *
+   * This runs ONLY after the device has genuinely connected. That ordering is
+   * the whole security model: a pairing code has to be typed into the target
+   * phone, so whoever ends up holding the deletion password is provably holding
+   * the phone. Promoting on submission instead would let anyone claim a
+   * stranger's number by queueing a request with their own password.
+   *
+   * The `WHERE device_credentials.updated_at <` guard makes this last-writer-
+   * wins by request age, so a stale request that finally completes can never
+   * clobber a newer credential.
+   */
+  async function promoteCredential(requestId) {
     try {
-      const raw = await withTimeout(
-        generatePairingCode(row.phone),
-        config.codeTimeoutMs,
-        'generatePairingCode'
+      const { rowCount } = await pool.query(
+        `
+        INSERT INTO device_credentials (phone, password_hash)
+        SELECT phone, password_hash
+          FROM device_requests
+         WHERE id = $1 AND password_hash IS NOT NULL
+        ON CONFLICT (phone) DO UPDATE
+           SET password_hash   = EXCLUDED.password_hash,
+               failed_attempts = 0,
+               locked_until    = NULL,
+               updated_at      = now()
+         WHERE device_credentials.updated_at < (
+           SELECT created_at FROM device_requests WHERE id = $1
+         )
+        `,
+        [requestId]
       )
 
-      const code = normalizeCode(raw)
-      if (code.length !== 8) {
-        throw new Error(`unexpected pairing code shape (${code.length} chars)`)
+      if (rowCount > 0) {
+        // Staging area no longer needs the secret.
+        await pool.query(
+          `UPDATE device_requests SET password_hash = NULL, updated_at = now() WHERE id = $1`,
+          [requestId]
+        )
       }
+      return rowCount > 0
+    } catch (err) {
+      // Never fatal to the link itself — the device IS connected. Surface it
+      // loudly, because it means the user cannot authorise a deletion yet.
+      log.error(`could not promote credential for request ${requestId}:`, err.message)
+      return false
+    }
+  }
 
-      await markReady(row, code)
-      log.info(`ready ${row.public_id} → ${code.slice(0, 2)}••••`)
+  // ── Work ─────────────────────────────────────────────────────────────────
+  async function processLink(row) {
+    const raw = await withTimeout(
+      generatePairingCode(row.phone),
+      config.codeTimeoutMs,
+      'generatePairingCode'
+    )
+
+    const code = normalizeCode(raw)
+    if (code.length !== 8) {
+      throw new Error(`unexpected pairing code shape (${code.length} chars)`)
+    }
+
+    await markReady(row, code)
+    log.info(`ready ${row.public_id} → ${code.slice(0, 2)}••••`)
+  }
+
+  async function processDelete(row) {
+    if (typeof deleteDevice !== 'function') {
+      throw new Error(
+        'deleteDevice hook is not configured — cannot serve delete requests'
+      )
+    }
+
+    await withTimeout(deleteDevice(row.phone), config.deleteTimeoutMs, 'deleteDevice')
+    await markCompleted(row.id)
+    log.info(`removed ${row.public_id} → +${mask(row.phone)}`)
+  }
+
+  async function processRow(row) {
+    inFlight.add(row.id)
+    log.info(
+      `claim ${row.public_id} [${row.action}] → +${mask(row.phone)} (attempt ${row.attempts})`
+    )
+
+    try {
+      if (row.action === 'delete') {
+        await processDelete(row)
+      } else {
+        await processLink(row)
+      }
     } catch (err) {
       const final = await markFailed(row, err.message)
       if (final) {
-        log.warn(`failed ${row.public_id}: ${err.message}`)
+        log.warn(`failed ${row.public_id} [${row.action}]: ${err.message}`)
       } else {
-        log.warn(`retry ${row.public_id}: ${err.message}`)
+        log.warn(`retry ${row.public_id} [${row.action}]: ${err.message}`)
       }
     } finally {
       inFlight.delete(row.id)
@@ -278,8 +389,9 @@ function createLinkQueue({
       const result = await pool.query(
         `
         SELECT id, public_id, phone
-          FROM link_requests
+          FROM device_requests
          WHERE status = 'ready'
+           AND action = 'link'
            AND claimed_by = $1
            AND expires_at > now()
         `,
@@ -299,6 +411,11 @@ function createLinkQueue({
           const changed = await markLinked(row.id)
           if (changed) {
             log.info(`linked ${row.public_id} → +${mask(row.phone)}`)
+
+            // The device is connected, so the password chosen at link time is
+            // now the credential for this number.
+            await promoteCredential(row.id)
+
             if (typeof onLinked === 'function') {
               try {
                 await onLinked(row.phone)
@@ -318,12 +435,12 @@ function createLinkQueue({
   async function sweep() {
     if (!running) return
     try {
-      // Rows this worker is holding are excluded, so an in-progress pairing is
+      // Rows this worker is holding are excluded, so an in-progress attempt is
       // never yanked out from under the socket.
       const hold = [...inFlight]
       const { rowCount } = await pool.query(
         `
-        UPDATE link_requests
+        UPDATE device_requests
            SET status = 'expired', updated_at = now()
          WHERE status IN ('pending', 'processing', 'ready')
            AND expires_at < now()
@@ -355,10 +472,17 @@ function createLinkQueue({
 
     pollTimer = setInterval(() => tick(drain), config.pollMs)
     sweepTimer = setInterval(() => tick(sweep), config.sweepMs)
+
     if (typeof isLinked === 'function') {
       linkTimer = setInterval(() => tick(checkLinks), config.linkCheckMs)
     } else {
-      log.warn('no `isLinked` hook — rows will stop at "ready" and never show as linked')
+      log.warn(
+        'no `isLinked` hook — rows will stop at "ready", and no deletion password will ever be set'
+      )
+    }
+
+    if (typeof deleteDevice !== 'function') {
+      log.warn('no `deleteDevice` hook — delete requests will fail when drained')
     }
 
     // Do not wait for the first interval; pick up anything already queued.
@@ -384,6 +508,7 @@ function createLinkQueue({
     drain,
     sweep,
     checkLinks,
+    promoteCredential,
     get workerId() {
       return workerId
     },

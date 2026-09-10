@@ -5,13 +5,14 @@ import { useCallback, useEffect, useState } from 'react'
 import { COUNTRIES, DEFAULT_COUNTRY_ISO } from '@/lib/countries'
 
 /**
- * The whole linking flow lives here.
+ * The whole device flow lives here: linking and removing.
  *
  * Phases:
- *   input / submitting → number entry
- *   waiting            → request queued, bot is producing a code
- *   ready              → code on screen, user types it into WhatsApp
- *   linked             → bot confirmed the device connected
+ *   input / submitting → number (and password) entry
+ *   waiting            → job queued, the bot is working on it
+ *   ready              → pairing code on screen, user types it into WhatsApp
+ *   linked             → bot confirmed the device connected   (link)
+ *   completed          → bot wiped the session                (remove)
  *   expired / error / blocked → recoverable dead ends
  */
 
@@ -20,12 +21,7 @@ const POLL_WAITING_MS = 2000
 // so we can back right off and stop hammering the endpoint.
 const POLL_READY_MS = 4000
 
-function formatDuration(totalSeconds) {
-  const s = Math.max(0, Math.floor(totalSeconds || 0))
-  const m = Math.floor(s / 60)
-  const r = s % 60
-  return `${m}:${String(r).padStart(2, '0')}`
-}
+const MIN_PASSWORD_LENGTH = 8
 
 const CHIP = {
   input: { text: 'Idle', tone: 'neutral' },
@@ -33,38 +29,42 @@ const CHIP = {
   waiting: { text: 'Working', tone: 'active' },
   ready: { text: 'Action needed', tone: 'active' },
   linked: { text: 'Linked', tone: 'good' },
+  completed: { text: 'Removed', tone: 'good' },
   expired: { text: 'Expired', tone: 'bad' },
   error: { text: 'Failed', tone: 'bad' },
   blocked: { text: 'Throttled', tone: 'bad' },
 }
 
+function formatDuration(totalSeconds) {
+  const s = Math.max(0, Math.floor(totalSeconds || 0))
+  const m = Math.floor(s / 60)
+  const r = s % 60
+  return `${m}:${String(r).padStart(2, '0')}`
+}
+
 function StatusChip({ phase }) {
   const chip = CHIP[phase] || CHIP.input
   const toneClass =
-    chip.tone === 'active'
+    chip.tone === 'active' || chip.tone === 'good'
       ? 'text-amber border-amber/40'
+      : chip.tone === 'bad'
+        ? 'text-rust border-rust/40'
+        : 'text-paper-faint border-[color:var(--hairline-strong)]'
+
+  const dotClass =
+    chip.tone === 'active'
+      ? 'bg-amber animate-pulse-soft'
       : chip.tone === 'good'
-        ? 'text-amber border-amber/40'
+        ? 'bg-amber'
         : chip.tone === 'bad'
-          ? 'text-rust border-rust/40'
-          : 'text-paper-faint border-[color:var(--hairline-strong)]'
+          ? 'bg-rust'
+          : 'bg-paper-faint'
 
   return (
     <span
       className={`inline-flex items-center gap-2 border px-2.5 py-1 font-mono text-[10px] uppercase tracking-label ${toneClass}`}
     >
-      <span
-        className={`h-1.5 w-1.5 shrink-0 rounded-full ${
-          chip.tone === 'active'
-            ? 'bg-amber animate-pulse-soft'
-            : chip.tone === 'good'
-              ? 'bg-amber'
-              : chip.tone === 'bad'
-                ? 'bg-rust'
-                : 'bg-paper-faint'
-        }`}
-        aria-hidden="true"
-      />
+      <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${dotClass}`} aria-hidden="true" />
       {chip.text}
     </span>
   )
@@ -102,9 +102,11 @@ function Step({ n, title, detail, state }) {
         )}
       </div>
       <div className="pb-5">
-        <p className={`font-mono text-[10px] uppercase tracking-label ${
-          done || active ? 'text-paper' : 'text-paper-faint'
-        }`}>
+        <p
+          className={`font-mono text-[10px] uppercase tracking-label ${
+            done || active ? 'text-paper' : 'text-paper-faint'
+          }`}
+        >
           {n} — {title}
         </p>
         {detail ? (
@@ -115,10 +117,76 @@ function Step({ n, title, detail, state }) {
   )
 }
 
+function PasswordField({ id, label, value, onChange, disabled, autoComplete, help }) {
+  const [show, setShow] = useState(false)
+  return (
+    <div>
+      <div className="flex items-baseline justify-between gap-3">
+        <label htmlFor={id} className="label">
+          {label}
+        </label>
+        <button
+          type="button"
+          onClick={() => setShow((s) => !s)}
+          className="font-mono text-[10px] uppercase tracking-label text-paper-faint hover:text-amber"
+          aria-pressed={show}
+        >
+          {show ? 'Hide' : 'Show'}
+        </button>
+      </div>
+      <input
+        id={id}
+        name={id}
+        type={show ? 'text' : 'password'}
+        className="field mt-2"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        disabled={disabled}
+        autoComplete={autoComplete}
+        spellCheck={false}
+        autoCapitalize="off"
+        aria-describedby={help ? `${id}-help` : undefined}
+      />
+      {help ? (
+        <p id={`${id}-help`} className="mt-2 text-[12px] leading-relaxed text-paper-faint">
+          {help}
+        </p>
+      ) : null}
+    </div>
+  )
+}
+
+/** Live requirement list — cheaper for the user than a rejection after submit. */
+function PasswordRules({ password }) {
+  const rules = [
+    { label: `${MIN_PASSWORD_LENGTH}+ characters`, met: password.length >= MIN_PASSWORD_LENGTH },
+    { label: 'A letter', met: /[A-Za-z]/.test(password) },
+    { label: 'A number', met: /[0-9]/.test(password) },
+  ]
+  return (
+    <ul className="mt-2.5 flex flex-wrap gap-x-4 gap-y-1.5">
+      {rules.map((r) => (
+        <li
+          key={r.label}
+          className={`font-mono text-[10px] uppercase tracking-label ${
+            r.met ? 'text-amber' : 'text-paper-faint'
+          }`}
+        >
+          {r.met ? '•' : '·'} {r.label}
+        </li>
+      ))}
+    </ul>
+  )
+}
+
 export default function Linker() {
+  const [mode, setMode] = useState('link')
   const [phase, setPhase] = useState('input')
   const [countryIso, setCountryIso] = useState(DEFAULT_COUNTRY_ISO)
   const [national, setNational] = useState('')
+  const [password, setPassword] = useState('')
+  const [confirm, setConfirm] = useState('')
+  const [acknowledged, setAcknowledged] = useState(false)
 
   const [request, setRequest] = useState(null)
   const [botStatus, setBotStatus] = useState(null)
@@ -132,6 +200,8 @@ export default function Linker() {
   const country = COUNTRIES.find((c) => c.iso === countryIso) ?? COUNTRIES[0]
   const publicId = request?.publicId || null
   const busy = phase === 'submitting'
+  const isRemove = mode === 'remove'
+  const action = request?.action || mode
 
   useEffect(() => {
     const id = setInterval(() => setNow(Date.now()), 1000)
@@ -151,6 +221,20 @@ export default function Linker() {
     }
   }, [phase, secondsLeft])
 
+  const reset = useCallback((nextMode) => {
+    setMode(nextMode ?? mode)
+    setPhase('input')
+    setRequest(null)
+    setBotStatus(null)
+    setCode(null)
+    setError(null)
+    setCopyState('idle')
+    setNational('')
+    setPassword('')
+    setConfirm('')
+    setAcknowledged(false)
+  }, [mode])
+
   // ── Polling ───────────────────────────────────────────────────────────────
   // Stays alive through 'ready' as well, because the transition we actually care
   // about — the bot seeing the device connect — happens after the code is shown.
@@ -163,7 +247,7 @@ export default function Linker() {
 
     const poll = async () => {
       try {
-        const res = await fetch(`/api/link/${encodeURIComponent(publicId)}`, {
+        const res = await fetch(`/api/requests/${encodeURIComponent(publicId)}`, {
           cache: 'no-store',
         })
         const data = await res.json().catch(() => null)
@@ -180,10 +264,11 @@ export default function Linker() {
             if (data.pairingCode) setCode(data.pairingCode)
             setPhase('linked')
             break
+          case 'completed':
+            setPhase('completed')
+            break
           case 'failed':
-            setError({
-              message: data.message || 'The pairing could not be completed.',
-            })
+            setError({ message: data.message || 'The request could not be completed.' })
             setPhase('error')
             break
           case 'expired':
@@ -208,11 +293,20 @@ export default function Linker() {
     }
   }, [phase, publicId])
 
-  // ── Actions ───────────────────────────────────────────────────────────────
+  // ── Submit ────────────────────────────────────────────────────────────────
   const onSubmit = useCallback(
     async (event) => {
       event.preventDefault()
       if (busy) return
+
+      // Confirm locally before spending a request. The server never sees the
+      // confirmation field — it exists purely so a typo cannot silently lock
+      // someone out of their own device.
+      if (!isRemove && password !== confirm) {
+        setError({ message: 'The two passwords do not match.' })
+        setPhase('error')
+        return
+      }
 
       setError(null)
       setCode(null)
@@ -220,11 +314,16 @@ export default function Linker() {
       setBotStatus(null)
       setPhase('submitting')
 
+      const endpoint = isRemove ? '/api/unlink' : '/api/link'
+      const body = isRemove
+        ? { dialCode: country.dial, national, password }
+        : { dialCode: country.dial, national, password }
+
       try {
-        const res = await fetch('/api/link', {
+        const res = await fetch(endpoint, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ dialCode: country.dial, national }),
+          body: JSON.stringify(body),
         })
         const data = await res.json().catch(() => null)
 
@@ -248,18 +347,8 @@ export default function Linker() {
         setPhase('error')
       }
     },
-    [busy, country.dial, national]
+    [busy, confirm, country.dial, isRemove, national, password]
   )
-
-  const reset = useCallback(() => {
-    setPhase('input')
-    setRequest(null)
-    setBotStatus(null)
-    setCode(null)
-    setError(null)
-    setCopyState('idle')
-    setNational('')
-  }, [])
 
   const copyCode = useCallback(async () => {
     if (!code) return
@@ -280,15 +369,50 @@ export default function Linker() {
     return () => clearTimeout(id)
   }, [copyState])
 
-  // ── Render helpers ────────────────────────────────────────────────────────
+  // ── Render ────────────────────────────────────────────────────────────────
   const showForm = phase === 'input' || phase === 'submitting'
+  const canSubmit = isRemove
+    ? Boolean(national.trim() && password) && acknowledged && !busy
+    : Boolean(national.trim() && password && confirm) && !busy
 
   return (
     <div className="border bg-ink-900/60 hairline">
-      {/* Card header — state chip, so the user always knows where they are. */}
       <div className="flex items-center justify-between gap-3 border-b px-5 py-3.5 hairline">
-        <span className="label">Pairing</span>
+        <span className="label">{isRemove ? 'Removal' : 'Pairing'}</span>
         <StatusChip phase={phase} />
+      </div>
+
+      {/* Mode switcher. Locked while a job is in flight so a half-finished
+          request can never be orphaned in the UI. */}
+      <div
+        className="grid grid-cols-2 border-b hairline"
+        role="tablist"
+        aria-label="Device action"
+      >
+        {[
+          { id: 'link', label: 'Link a device' },
+          { id: 'remove', label: 'Remove a device' },
+        ].map((tab) => {
+          const selected = mode === tab.id
+          const locked = !showForm
+          return (
+            <button
+              key={tab.id}
+              type="button"
+              role="tab"
+              aria-selected={selected}
+              disabled={locked}
+              onClick={() => reset(tab.id)}
+              className={`px-4 py-3 font-mono text-[11px] uppercase tracking-label transition-colors ${
+                selected ? 'text-amber' : 'text-paper-faint hover:text-paper'
+              } ${locked ? 'cursor-not-allowed opacity-50' : ''} ${
+                tab.id === 'link' ? 'border-r hairline' : ''
+              }`}
+            >
+              {tab.label}
+            </button>
+          )
+        })}
       </div>
 
       {/* Announce status transitions to assistive tech without stealing focus. */}
@@ -338,9 +462,63 @@ export default function Linker() {
             </div>
 
             <p id="phone-help" className="mt-2.5 text-[12px] leading-relaxed text-paper-faint">
-              Enter the number as it appears on that phone. A leading zero is fine —
-              we drop it and use the country code for you.
+              {isRemove
+                ? 'The number you linked to the bot. A leading zero is fine — we drop it for you.'
+                : 'Enter the number as it appears on that phone. A leading zero is fine — we drop it and use the country code for you.'}
             </p>
+
+            <div className="mt-6">
+              <PasswordField
+                id="password"
+                label={isRemove ? 'Your password' : 'Set a password'}
+                value={password}
+                onChange={setPassword}
+                disabled={busy}
+                autoComplete={isRemove ? 'current-password' : 'new-password'}
+                help={
+                  isRemove
+                    ? 'The password you chose when you linked this device. It is the only way to authorise removal.'
+                    : undefined
+                }
+              />
+              {!isRemove ? <PasswordRules password={password} /> : null}
+            </div>
+
+            {!isRemove ? (
+              <>
+                <div className="mt-5">
+                  <PasswordField
+                    id="confirm"
+                    label="Confirm password"
+                    value={confirm}
+                    onChange={setConfirm}
+                    disabled={busy}
+                    autoComplete="new-password"
+                  />
+                </div>
+
+                <p className="mt-5 border-l-2 border-amber pl-3 text-[12.5px] leading-relaxed text-paper-muted">
+                  Write this password down. Removing this device later will ask for
+                  it, and there is no reset link — we have no account to email one
+                  to. If you lose it you can still set a new one by linking the
+                  number again from the phone itself.
+                </p>
+              </>
+            ) : (
+              <label className="mt-5 flex cursor-pointer items-start gap-3 border-l-2 border-rust pl-3">
+                <input
+                  type="checkbox"
+                  checked={acknowledged}
+                  onChange={(e) => setAcknowledged(e.target.checked)}
+                  disabled={busy}
+                  className="mt-0.5 h-4 w-4 shrink-0 accent-[#C9603F]"
+                />
+                <span className="text-[12.5px] leading-relaxed text-paper-muted">
+                  I understand this disconnects the bot from this number and removes
+                  its saved session.
+                </span>
+              </label>
+            )}
 
             {error ? (
               <p className="mt-5 border-l-2 border-rust pl-3 text-[13px] leading-relaxed text-paper-muted">
@@ -348,13 +526,21 @@ export default function Linker() {
               </p>
             ) : null}
 
-            <button
-              type="submit"
-              className="btn-primary mt-6"
-              disabled={busy || !national.trim()}
-            >
-              {busy ? 'Requesting code' : 'Link device'}
+            <button type="submit" className="btn-primary mt-6" disabled={!canSubmit}>
+              {busy
+                ? isRemove
+                  ? 'Authorising'
+                  : 'Requesting code'
+                : isRemove
+                  ? 'Remove device'
+                  : 'Link device'}
             </button>
+
+            {isRemove && !password ? (
+              <p className="mt-3 text-[12px] leading-relaxed text-paper-faint">
+                Enter the password you set when you linked this number to continue.
+              </p>
+            ) : null}
           </form>
         ) : null}
 
@@ -362,34 +548,45 @@ export default function Linker() {
           <div className="animate-rise">
             <p className="label-amber">In progress</p>
             <h2 className="mt-3 font-display text-[19px] font-medium text-paper">
-              Preparing your pairing code
+              {action === 'delete' ? 'Removing the device' : 'Preparing your pairing code'}
             </h2>
             <p className="mt-2 text-[13.5px] leading-relaxed text-paper-muted">
-              Keep this page open. WhatsApp is issuing a code for{' '}
-              <span className="font-mono text-[13px] text-paper">{request?.phone}</span>.
+              {action === 'delete' ? (
+                <>
+                  Authorised. The bot is disconnecting{' '}
+                  <span className="font-mono text-[13px] text-paper">{request?.phone}</span> now.
+                </>
+              ) : (
+                <>
+                  Keep this page open. WhatsApp is issuing a code for{' '}
+                  <span className="font-mono text-[13px] text-paper">{request?.phone}</span>.
+                </>
+              )}
             </p>
 
             <ol className="mt-7">
               <Step
                 n="01"
                 title="Request received"
-                detail="Your number is queued and waiting for the bot."
+                detail="Your authorisation is queued and waiting for the bot."
                 state="done"
               />
               <Step
                 n="02"
-                title="Generating pairing code"
+                title={action === 'delete' ? 'Removing the device' : 'Generating pairing code'}
                 detail={
                   botStatus === 'processing'
-                    ? 'The bot has your request and is asking WhatsApp for a code.'
+                    ? action === 'delete'
+                      ? 'The bot has your request and is disconnecting the device.'
+                      : 'The bot has your request and is asking WhatsApp for a code.'
                     : 'Waiting for the bot to pick up your request.'
                 }
                 state={botStatus === 'processing' ? 'active' : 'todo'}
               />
               <Step
                 n="03"
-                title="Enter the code on WhatsApp"
-                detail="The code will appear here."
+                title={action === 'delete' ? 'Finished' : 'Enter the code on WhatsApp'}
+                detail={action === 'delete' ? 'This page updates when it is done.' : 'The code will appear here.'}
                 state="todo"
               />
             </ol>
@@ -401,7 +598,7 @@ export default function Linker() {
               </span>
             </div>
 
-            <button type="button" onClick={reset} className="btn-ghost mt-4 w-full">
+            <button type="button" onClick={() => reset()} className="btn-ghost mt-4 w-full">
               Cancel
             </button>
           </div>
@@ -471,9 +668,10 @@ export default function Linker() {
 
             <p className="mt-3 text-[12px] leading-relaxed text-paper-faint">
               This page confirms automatically once WhatsApp connects the device.
+              Your password takes effect at that moment.
             </p>
 
-            <button type="button" onClick={reset} className="btn-ghost mt-4 w-full">
+            <button type="button" onClick={() => reset()} className="btn-ghost mt-4 w-full">
               Start over
             </button>
           </div>
@@ -487,15 +685,35 @@ export default function Linker() {
             </h2>
             <p className="mt-2 text-[13.5px] leading-relaxed text-paper-muted">
               <span className="font-mono text-[13px] text-paper">{request?.phone}</span> is now
-              linked to the bot. You can close this page — the connection keeps
-              running in the background.
+              linked to the bot, and the password you chose now authorises its
+              removal. You can close this page — the connection keeps running.
             </p>
             <p className="mt-4 text-[12.5px] leading-relaxed text-paper-faint">
-              To disconnect later, remove the device from Linked devices inside
-              WhatsApp itself.
+              To disconnect later, come back to this page and use Remove a device.
             </p>
-            <button type="button" onClick={reset} className="btn-ghost mt-6 w-full">
+            <button type="button" onClick={() => reset()} className="btn-ghost mt-6 w-full">
               Link another number
+            </button>
+          </div>
+        ) : null}
+
+        {phase === 'completed' ? (
+          <div className="animate-rise">
+            <p className="label-amber">Removed</p>
+            <h2 className="mt-3 font-display text-[19px] font-medium text-paper">
+              Device disconnected
+            </h2>
+            <p className="mt-2 text-[13.5px] leading-relaxed text-paper-muted">
+              The bot has disconnected from{' '}
+              <span className="font-mono text-[13px] text-paper">{request?.phone}</span> and
+              removed its saved session.
+            </p>
+            <p className="mt-4 text-[12.5px] leading-relaxed text-paper-faint">
+              If the device still appears in WhatsApp under Linked devices, remove
+              it there as well — that list is WhatsApp's, not ours.
+            </p>
+            <button type="button" onClick={() => reset()} className="btn-ghost mt-6 w-full">
+              Done
             </button>
           </div>
         ) : null}
@@ -504,13 +722,14 @@ export default function Linker() {
           <div className="animate-rise">
             <p className="label text-rust">Expired</p>
             <h2 className="mt-3 font-display text-[19px] font-medium text-paper">
-              That code timed out
+              {action === 'delete' ? 'That request timed out' : 'That code timed out'}
             </h2>
             <p className="mt-2 text-[13.5px] leading-relaxed text-paper-muted">
-              Nothing was linked. Codes only stay valid for a few minutes, and the
-              bot may not have reached your number in time.
+              {action === 'delete'
+                ? 'The bot did not pick up the removal in time, so nothing was changed. You can authorise it again.'
+                : 'Nothing was linked. Codes only stay valid for a few minutes, and the bot may not have reached your number in time.'}
             </p>
-            <button type="button" onClick={reset} className="btn-primary mt-6">
+            <button type="button" onClick={() => reset()} className="btn-primary mt-6">
               Try again
             </button>
           </div>
@@ -518,14 +737,14 @@ export default function Linker() {
 
         {phase === 'blocked' ? (
           <div className="animate-rise">
-            <p className="label text-rust">Too many requests</p>
+            <p className="label text-rust">Too many attempts</p>
             <h2 className="mt-3 font-display text-[19px] font-medium text-paper">
               Slow down for a moment
             </h2>
             <p className="mt-2 text-[13.5px] leading-relaxed text-paper-muted">
-              {error?.message || 'Please wait a little before requesting another code.'}
+              {error?.message || 'Please wait a little before trying again.'}
             </p>
-            <button type="button" onClick={reset} className="btn-ghost mt-6 w-full">
+            <button type="button" onClick={() => reset()} className="btn-ghost mt-6 w-full">
               Back
             </button>
           </div>
@@ -540,7 +759,7 @@ export default function Linker() {
             <p className="mt-2 text-[13.5px] leading-relaxed text-paper-muted">
               {error?.message || 'Something went wrong. Please try again.'}
             </p>
-            <button type="button" onClick={reset} className="btn-primary mt-6">
+            <button type="button" onClick={() => reset()} className="btn-primary mt-6">
               Try again
             </button>
           </div>

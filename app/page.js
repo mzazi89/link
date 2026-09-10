@@ -3,8 +3,8 @@ import Linker from '@/components/Linker'
 const STEPS = [
   {
     n: '01',
-    title: 'Enter your number',
-    body: 'Pick your country and type the WhatsApp number you want to connect. Use the number that is actually on the phone — not a second number you have access to.',
+    title: 'Enter your number and set a password',
+    body: 'Pick your country and type the number you want to connect — the one actually on that phone. Then choose a password. It is not an account password and it never gets typed on the phone; it is what authorises removing this device later, so store it somewhere safe.',
   },
   {
     n: '02',
@@ -19,7 +19,7 @@ const STEPS = [
   {
     n: '04',
     title: 'Done',
-    body: 'This page confirms the moment the device connects. The bot keeps running in the background after you close the tab.',
+    body: 'This page confirms the moment the device connects. Your password becomes active at that point, and the bot keeps running after you close the tab.',
   },
 ]
 
@@ -29,8 +29,12 @@ const NOTES = [
     body: 'The code is entered on the phone itself, inside WhatsApp. If you close the app before entering it, the code expires and you will need a new one.',
   },
   {
-    title: 'One number per request',
-    body: 'Link them one at a time. Requesting a code for a second number while the first is pending will only slow both down.',
+    title: 'Your password removes the device',
+    body: 'Switch to Remove a device on this page, enter the number and that password, and the bot disconnects and wipes its session. We only ever store a hash of it — nobody here can read your password back to you.',
+  },
+  {
+    title: 'If you forget the password',
+    body: 'Link the number again from the phone and you can set a new one. Whoever holds the phone can always re-establish control, which is exactly why the password is set at link time rather than beforehand.',
   },
   {
     title: 'Your number is not shown publicly',
@@ -80,9 +84,9 @@ export default function HomePage() {
           to the bot.
         </h1>
         <p className="mt-6 max-w-[52ch] text-[15px] leading-relaxed text-paper-muted">
-          No account, no password. Enter the number you want to connect and we
-          will generate a pairing code. Type that code into WhatsApp and the
-          device is linked.
+          No account to create. Enter the number you want to connect, choose a
+          password, and we will generate a pairing code to type into WhatsApp.
+          That password is what removes the device again later — so keep it.
         </p>
       </section>
 

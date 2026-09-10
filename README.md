@@ -1,9 +1,14 @@
 # MZAZI TECH — Link a device
 
 A public, login-free site whose only job is connecting a WhatsApp number to the
-bot. The user enters their number, taps **Link device**, and gets an 8-character
-pairing code to type into WhatsApp. There is no sign-up, no password, and no
-session.
+bot — and disconnecting it again. The user enters their number, **sets a
+password**, taps **Link device**, and gets an 8-character pairing code to type
+into WhatsApp. There is no sign-up and no session.
+
+That password is not a login. It is the per-number secret that authorises
+**removing** the device later, which is the only way to protect a destructive
+action on a site with no accounts. See [Passwords and
+removal](#passwords-and-removal).
 
 It is the fourth repo in the MZAZI TECH stack and it follows the same rule as the
 others: **the shared Neon database is the only integration point.**
@@ -27,40 +32,71 @@ conversation:
 ```
   browser                link site (this repo)              quartz bot
      │                          │                              │
-     │  POST /api/link          │                              │
+      │  POST /api/link          │                              │
+      │  { phone, password }     │                              │
+      │─────────────────────────>│                              │
+      │                          │  INSERT device_requests      │
+      │                          │  action = 'link'             │
+      │                          │  status = 'pending'          │
+      │  { publicId }            │─────────────────────────────>│
+      │<─────────────────────────│                              │
+      │                          │              claim (SKIP LOCKED)
+      │  GET /api/requests/{id}  │                   status = 'processing'
+      │─────────────────────────>│<─────────────────────────────│
+      │  { status: 'pending' }   │                              │  requestPairingCode()
+      │<─────────────────────────│                              │
+      │        ⋮                 │              write code      │
+      │                          │<─────────────────────────────│
+      │                          │                   status = 'ready'
+      │  { status: 'ready',      │                              │
+      │    pairingCode }         │                              │
+      │<─────────────────────────│                              │
+      │   user types the code into WhatsApp                     │
+      │                          │         device connected     │
+      │                          │<─────────────────────────────│
+      │  { status: 'linked' }    │                   status = 'linked'
+      │<─────────────────────────│   + password promoted into   │
+      │                          │     device_credentials       │
+ ```
+
+Deletion travels the same queue, having passed the password check first:
+
+```
+  browser                  link site                       quartz bot
+     │                          │                              │
+     │  POST /api/unlink        │                              │
+     │  { phone, password }     │                              │
      │─────────────────────────>│                              │
-     │                          │  INSERT link_requests        │
-     │                          │  status = 'pending'          │
-     │  { publicId }            │─────────────────────────────>│
-     │<─────────────────────────│                              │
-     │                          │              claim (SKIP LOCKED)
-     │  GET /api/link/{id}      │                   status = 'processing'
-     │─────────────────────────>│<─────────────────────────────│
-     │  { status: 'pending' }   │                              │  requestPairingCode()
-     │<─────────────────────────│                              │
-     │        ⋮                 │              write code      │
-     │                          │<─────────────────────────────│
-     │                          │                   status = 'ready'
-     │  { status: 'ready',      │                              │
-     │    pairingCode }         │                              │
-     │<─────────────────────────│                              │
-     │   user types the code into WhatsApp                     │
-     │                          │         device connected     │
-     │                          │<─────────────────────────────│
-     │  { status: 'linked' }    │                   status = 'linked'
+     │                          │  verify against              │
+     │                          │  device_credentials          │
+     │                          │  (scrypt, constant time)     │
+     │                          │                              │
+     │                          │  wrong → 401, same message   │
+     │                          │  and same work as "no such   │
+     │                          │  device"; counter incremented│
+     │                          │                              │
+     │                          │  correct → INSERT            │
+     │  { publicId }            │  action = 'delete'           │
+     │<─────────────────────────│─────────────────────────────>│
+     │  GET /api/requests/{id}  │        logout + wipe session │
+     │─────────────────────────>│                              │
+     │  { status:'completed' }  │                   status = 'completed'
      │<─────────────────────────│                              │
 ```
 
 ### Status lifecycle
 
-| Status | Written by | Meaning |
-|---|---|---|
-| `pending` | site | Queued, no worker has touched it. |
-| `processing` | bot | Claimed; the bot is asking WhatsApp for a code. |
-| `ready` | bot | `pairing_code` is set. Waiting on the user. |
-| `linked` | bot | The device connected. Terminal. |
-| `failed` | bot | Gave up after `maxAttempts`. Terminal. |
-| `expired` | bot (sweeper) or site | Window closed first. Terminal. |
+| Action | Status | Written by | Meaning |
+|---|---|---|---|
+| link | `pending` | site | Queued, no worker has touched it. |
+| link | `processing` | bot | Claimed; the bot is asking WhatsApp for a code. |
+| link | `ready` | bot | `pairing_code` is set. Waiting on the user. |
+| link | `linked` | bot | The device connected. **Terminal.** |
+| delete | `pending` | site | Queued after the password check passed. |
+| delete | `processing` | bot | Claimed; the session is being disconnected and wiped. |
+| delete | `completed` | bot | The session is gone. **Terminal.** |
+| either | `failed` | bot | Gave up after `maxAttempts`. **Terminal.** |
+| either | `expired` | bot (sweeper) or site | Window closed first. **Terminal.** |
 
 The site also lazily expires rows it finds past `expires_at` while still in
 `pending` — an unclaimed row would otherwise spin forever. It deliberately does
@@ -82,6 +118,12 @@ npm run dev                    # http://localhost:3000
 use. `lib/schema.sql` is entirely idempotent, so it is safe to re-run on every
 deploy.
 
+> **Upgrading from the first version of this schema?** Re-run `npm run db:init`.
+> It renames `link_requests` to `device_requests` and adds the `action` and
+> `password_hash` columns inside a guarded `DO` block, so it is a no-op on a
+> fresh install and safe on an existing one. Any rows already in the table come
+> through as `action = 'link'`.
+
 ### Environment
 
 | Variable | Required | Description |
@@ -91,6 +133,9 @@ deploy.
 | `RATE_LIMIT_IP_MAX` / `RATE_LIMIT_IP_WINDOW_MIN` | no | Per-IP cap (default 5 per 15 min). |
 | `RATE_LIMIT_PHONE_MAX` / `RATE_LIMIT_PHONE_WINDOW_MIN` | no | Per-number cap (default 3 per 60 min). |
 | `LINK_TTL_MINUTES` | no | How long a request stays alive (default 10). |
+| `VERIFY_IP_MAX` / `VERIFY_IP_WINDOW_MIN` | no | Password guesses allowed per IP across all numbers (default 12 per 15 min). |
+| `VERIFY_LOCKOUT_AFTER` / `VERIFY_LOCKOUT_MINUTES` | no | Wrong guesses against one number before it locks (default 5, for 15 min). |
+| `VERIFY_LOG_RETENTION_DAYS` | no | How long `password_attempts` is kept (default 7). |
 | `IP_HASH_SALT` | recommended | Salt for hashing caller IPs before storage. |
 | `PGSSL_STRICT` | no | Set to `1` to enforce full TLS chain verification. |
 
@@ -116,9 +161,16 @@ const linkQueue = createLinkQueue({
     return await sock.requestPairingCode(msisdn)
   },
 
-  // Optional but strongly recommended — without it rows stop at 'ready' and the
-  // user never sees the success state.
+  // Required. Without it rows stop at 'ready', the user never sees the success
+  // state, AND no deletion password is ever set — because promotion happens here.
   isLinked: async (msisdn) => sessionExists(msisdn) && isConnected(msisdn),
+
+  // Required to serve delete requests. Mirror the existing semantics: unlink
+  // logs the device out, delete then removes the session folder.
+  deleteDevice: async (msisdn) => {
+    await logoutSession(msisdn)
+    await rmSessionFolder(msisdn)
+  },
 
   // Optional side effects when a device connects.
   onLinked: async (msisdn) => {
@@ -129,15 +181,37 @@ const linkQueue = createLinkQueue({
 await linkQueue.start()
 ```
 
-The two hooks are injected rather than called directly because `whatsapp.js`
+The hooks are injected rather than called directly because `whatsapp.js`
 builds sockets differently for Telegram-sourced and WhatsApp-sourced sessions,
 and the MZAZIBOT fork adds its own connection hooks. The queue mechanics are the
 part that has to be exactly right, so that is what the module owns.
 
+`deleteDevice` should **reject** if the wipe genuinely failed, so the row is
+retried rather than reported as done. Treating "I could not delete the folder"
+as success is the one way this flow can silently lie to a user.
+
 Tunables live in `DEFAULTS` in that file — `pollMs`, `maxAttempts`,
-`codeTimeoutMs`, `batchSize`. Pairing is stateful, so `batchSize` defaults to 1
-and attempts are serialised; raise it only if your pairing path is genuinely
-concurrent.
+`codeTimeoutMs`, `deleteTimeoutMs`, `batchSize`. Pairing is stateful, so
+`batchSize` defaults to 1 and attempts are serialised; raise it only if your
+pairing path is genuinely concurrent.
+
+### The one step that is easy to miss
+
+`promoteCredential` is called automatically the moment `isLinked` reports true.
+It copies the `password_hash` staged on the request into `device_credentials`
+and then nulls it on the request. If you write your own worker instead of using
+this module, that promotion is the part to replicate — skip it and every number
+will link fine and then be impossible to remove.
+
+It is also guarded so an old request cannot clobber a newer credential:
+
+```sql
+ON CONFLICT (phone) DO UPDATE
+   SET password_hash = EXCLUDED.password_hash, ...
+ WHERE device_credentials.updated_at < (
+   SELECT created_at FROM device_requests WHERE id = $1
+ )
+```
 
 ---
 
@@ -155,6 +229,61 @@ already rotated.
 
 ---
 
+## Passwords and removal
+
+With no accounts, a per-number password is the only proof of ownership the site
+can check before destroying something. Three decisions define it.
+
+### 1. The password is set at link time, and only becomes real on success
+
+A user picks a password while requesting a pairing code. It is hashed and stored
+**on the request row**, and the bot promotes it into `device_credentials` only
+after the device actually connects.
+
+Promoting on submission instead would be a hijack primitive: anyone could queue
+a request for a stranger's number with their own password, and the real owner
+would then be permanently locked out of the number they own. Because promotion
+waits for a pairing code to be typed into the target phone, whoever holds the
+password is provably holding the phone.
+
+This also gives a natural recovery path. There is no reset email — there is no
+account to send one to — but re-linking from the phone always sets a new
+password, and control of the phone is the real authority anyway.
+
+### 2. Hashing is scrypt from `node:crypto`
+
+No dependency, and no native build — the same class of problem the quartz repo
+works around by blocking the `sharp` peer. The stored format is
+self-describing:
+
+```
+scrypt$N$r$p$<base64 salt>$<base64 hash>
+```
+
+so the cost parameters can be raised later without invalidating any existing
+row. Current parameters are `N=16384, r=8, p=1` — about 16 MiB and ~55 ms per
+hash. That is below OWASP's headline scrypt figure (N=2^17), which would cost
+128 MiB per concurrent request and is not a reasonable ask of a serverless
+function. The trade is documented in `lib/password.js`.
+
+Verification is constant-time (`timingSafeEqual`), inputs are NFKC-normalised so
+a password typed on a phone matches the same password typed on a laptop, and
+parameters read back out of the database are bounded — otherwise a tampered row
+could specify an enormous `N` and turn one login attempt into a memory
+exhaustion attack.
+
+### 3. Failures are indistinguishable from "no such device"
+
+A wrong password and a number that was never linked return the **same status,
+the same message, and the same amount of cryptographic work** (`burnVerificationTime`).
+Otherwise the response would reveal whether a given phone number uses the
+service.
+
+The lockout is reported as `rate_limited` with `scope: 'ip'` even when it was
+really the per-number lockout, so the two cannot be told apart from outside.
+
+---
+
 ## Abuse controls — read this before going public
 
 Removing login removes the only thing that used to limit who could create a
@@ -162,16 +291,22 @@ session. What replaces it:
 
 - **Per-IP throttle** — 5 requests / 15 min by default.
 - **Per-phone throttle** — 3 requests / 60 min by default.
+- **Verification throttle** — 12 failed password guesses per IP per 15 min,
+  across all numbers. This catches someone spreading a few guesses over many
+  numbers, which the per-number lockout would never notice.
+- **Per-number lockout** — 5 wrong guesses locks that number for 15 min. scrypt
+  makes offline cracking hopeless but does nothing against online guessing, so
+  guessing is capped directly.
 - **Salted IP hashes** — `ip_hash` is a SHA-256 of `salt:ip`. Raw IPs are never
   written to the shared database, so the table cannot be turned into a log of
   who visited.
 - **Opaque references** — the browser polls a 24-character random `public_id`,
   never the row id, so the endpoint cannot be walked to read other people's
   codes.
-- **Fail-closed** — if the throttle check cannot run, requests are refused
-  rather than queued.
+- **Fail-closed** — if a throttle check cannot run, requests are refused rather
+  than queued or verified.
 
-Two things this site deliberately does **not** do, and you should decide about:
+Three things this site deliberately does **not** do, and you should decide about:
 
 1. **It does not check whether the number is already linked.** The endpoint is
    unauthenticated, so a "that number is already linked" reply would turn it into
@@ -190,6 +325,20 @@ Two things this site deliberately does **not** do, and you should decide about:
    rejected promise and the row lands in `failed` with your message shown to the
    user.
 
+3. **The password only gates deletion initiated from this page.** Deletion also
+   exists elsewhere in your stack — `/delpair` and `.delpair` on the bot, and
+   the admin panel's Sessions screen — and none of those read
+   `device_credentials`. So today a user can still wipe their own session by
+   command without knowing the password, and an admin bypasses it entirely.
+
+   That may be exactly what you want (the admin *should* bypass it; a user
+   deleting their own device by command is harmless). But if the password is
+   meant to be the single authority for removal, the bot's delete commands need
+   to verify against `device_credentials` too. The hashing is in
+   `lib/password.js` and the lookup is a single indexed read — copy
+   `lib/password.js` and `lib/credentials.js` into quartz and call
+   `loadCredential` + `verifyPassword` before the wipe. Ask me and I'll wire it.
+
 ---
 
 ## Files
@@ -200,12 +349,15 @@ app/
   layout.js                → document shell, fonts, metadata
   globals.css              → Ink & Bolt design tokens and component classes
   icon.svg                 → bolt monogram favicon
-  api/link/route.js        → POST create a link request
-  api/link/[publicId]/route.js → GET poll status + pairing code
+  api/link/route.js        → POST create a link request (requires a password)
+  api/unlink/route.js      → POST verify the password, queue a delete
+  api/requests/[publicId]/route.js → GET poll status, action + pairing code
 components/
   Linker.jsx               → the whole state machine (client)
 lib/
-  schema.sql               → link_requests DDL (idempotent)
+  schema.sql               → device_requests + device_credentials DDL (idempotent)
+  password.js              → scrypt hashing, verification, strength policy
+  credentials.js           → credential store + per-number lockout
   db.js                    → pooled pg client, cached across hot reloads
   phone.js                 → E.164 normalization and validation
   countries.js             → dial codes for the selector

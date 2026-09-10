@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import { randomBytes } from 'node:crypto'
 
 import { query } from '@/lib/db'
+import { hashPassword, validatePasswordStrength } from '@/lib/password'
 import { describeReason, formatE164, maskMsisdn, normalizePhone } from '@/lib/phone'
 import {
   checkRateLimits,
@@ -19,21 +20,31 @@ const NO_STORE = { 'Cache-Control': 'no-store' }
 /**
  * Create a link request.
  *
- * Body: { dialCode: "254", national: "712345678" }
+ * Body: { dialCode: "254", national: "712345678", password: "hunter2hunter" }
  *
  * Returns a publicId the browser polls with. The row lands in `pending` and the
  * quartz bot picks it up from there.
  *
- * Two deliberate design choices:
+ * ── The password ─────────────────────────────────────────────────────────────
  *
- *  1. We do NOT check whether the number is already paired with the bot. This
- *     endpoint is unauthenticated, so a "that number is already linked" reply
- *     would turn it into a free oracle for testing whether any given phone
- *     number uses the service. The request is queued regardless and the bot —
- *     which can see its own session folders — decides what to do.
+ * The user chooses it here, and it is what authorises deleting this number
+ * later. We store only a scrypt hash, and we store it ON THE REQUEST rather than
+ * in device_credentials — the bot promotes it only once the device has actually
+ * connected.
  *
- *  2. We do NOT echo whether the number is valid beyond basic shape checks, for
- *     the same reason.
+ * That indirection is the security-relevant part. If we wrote the credential on
+ * submission, anyone could claim a stranger's number by queueing a request with
+ * their own password and permanently lock out the real owner. A promotion
+ * happens only after a pairing code has been typed into the target phone, so
+ * whoever holds the password is provably holding the phone.
+ *
+ * ── What we deliberately do NOT do ───────────────────────────────────────────
+ *
+ * We never report whether the number is already linked to the bot. This endpoint
+ * is unauthenticated, so a "that number is already in use" reply would turn it
+ * into a free oracle for testing whether any given phone number uses the
+ * service. Requests are queued regardless and the bot decides — it can see its
+ * own session folders.
  */
 export async function POST(request) {
   let body
@@ -49,16 +60,23 @@ export async function POST(request) {
   const parsed = normalizePhone(body?.dialCode, body?.national)
   if (!parsed.ok) {
     return NextResponse.json(
-      {
-        ok: false,
-        error: parsed.reason,
-        message: describeReason(parsed.reason),
-      },
+      { ok: false, error: parsed.reason, message: describeReason(parsed.reason) },
       { status: 400, headers: NO_STORE }
     )
   }
 
   const { msisdn, dialCode } = parsed
+
+  // Validate the password before anything expensive. Cheap shape checks first,
+  // then throttling, and only then scrypt — so a flood of requests cannot make
+  // us burn 16 MiB of memory per call before the limiter has had a say.
+  const strength = validatePasswordStrength(body?.password, msisdn)
+  if (!strength.ok) {
+    return NextResponse.json(
+      { ok: false, error: strength.reason, message: strength.message },
+      { status: 400, headers: NO_STORE }
+    )
+  }
 
   const ip = clientIpFrom(request.headers)
   const ipHash = hashIp(ip)
@@ -89,7 +107,10 @@ export async function POST(request) {
         retryAfterSeconds: limit.retryAfterSeconds,
         message: describeRetry(limit.retryAfterSeconds),
       },
-      { status: 429, headers: { ...NO_STORE, 'Retry-After': String(limit.retryAfterSeconds || 60) } }
+      {
+        status: 429,
+        headers: { ...NO_STORE, 'Retry-After': String(limit.retryAfterSeconds || 60) },
+      }
     )
   }
 
@@ -98,17 +119,35 @@ export async function POST(request) {
   const publicId = randomBytes(18).toString('base64url')
   const ttlMinutes = Number.parseInt(process.env.LINK_TTL_MINUTES ?? '', 10) || 10
 
+  let passwordHash
+  try {
+    passwordHash = await hashPassword(body.password)
+  } catch (err) {
+    console.error('[link][api] hashing failed:', err.message)
+    return NextResponse.json(
+      {
+        ok: false,
+        error: 'unavailable',
+        message: 'Could not prepare your request. Please try again shortly.',
+      },
+      { status: 503, headers: NO_STORE }
+    )
+  }
+
   try {
     const { rows } = await query(
       `
-      INSERT INTO link_requests (public_id, phone, dial_code, ip_hash, user_agent, expires_at)
-      VALUES ($1, $2, $3, $4, $5, now() + make_interval(mins => $6::int))
+      INSERT INTO device_requests
+        (public_id, action, phone, dial_code, password_hash, ip_hash, user_agent, expires_at)
+      VALUES
+        ($1, 'link', $2, $3, $4, $5, $6, now() + make_interval(mins => $7::int))
       RETURNING public_id, status, created_at, expires_at
       `,
       [
         publicId,
         msisdn,
         dialCode,
+        passwordHash,
         ipHash,
         (request.headers.get('user-agent') || '').slice(0, 300),
         ttlMinutes,
@@ -120,6 +159,7 @@ export async function POST(request) {
       {
         ok: true,
         publicId: row.public_id,
+        action: 'link',
         status: row.status,
         phone: formatE164(msisdn),
         maskedPhone: maskMsisdn(msisdn),

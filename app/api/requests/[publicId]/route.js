@@ -1,8 +1,8 @@
 import { NextResponse } from 'next/server'
 
 import { query } from '@/lib/db'
-import { formatE164 } from '@/lib/phone'
 import { formatPairingCode } from '@/lib/pairingCode'
+import { formatE164 } from '@/lib/phone'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
@@ -10,14 +10,17 @@ export const dynamic = 'force-dynamic'
 const NO_STORE = { 'Cache-Control': 'no-store' }
 
 // Terminal states — once a row reaches one of these, polling can stop.
-const TERMINAL = new Set(['linked', 'failed', 'expired'])
+const TERMINAL = new Set(['linked', 'completed', 'failed', 'expired'])
 
 /**
- * Poll a link request.
+ * Poll a request.
  *
- * This is what the browser hits every couple of seconds while the user waits.
- * It returns only the fields the UI needs, and only returns the pairing code
- * once the bot has actually produced one.
+ * One endpoint for both actions: the browser waits the same way whether it is
+ * watching for a pairing code or waiting for a session to be wiped, and the row
+ * already carries `action` to say which.
+ *
+ * Only the fields the UI needs are returned, and the pairing code is only
+ * returned once the bot has actually produced one.
  */
 export async function GET(_request, { params }) {
   const publicId = String(params?.publicId || '')
@@ -36,10 +39,10 @@ export async function GET(_request, { params }) {
   try {
     const result = await query(
       `
-      SELECT public_id, phone, dial_code, status, pairing_code, error,
-             created_at, expires_at, code_ready_at, linked_at
-      FROM link_requests
-      WHERE public_id = $1
+      SELECT public_id, action, phone, dial_code, status, pairing_code, error,
+             created_at, expires_at, code_ready_at, linked_at, completed_at
+        FROM device_requests
+       WHERE public_id = $1
       `,
       [publicId]
     )
@@ -73,17 +76,16 @@ export async function GET(_request, { params }) {
   if (expired && status === 'pending') {
     try {
       await query(
-        `UPDATE link_requests
+        `UPDATE device_requests
             SET status = 'expired', updated_at = now()
           WHERE public_id = $1 AND status = 'pending'`,
         [publicId]
       )
-      status = 'expired'
     } catch (err) {
       // Non-fatal: report expiry to the client even if the write lost a race.
       console.warn('[link][status] lazy expiry write failed:', err.message)
-      status = 'expired'
     }
+    status = 'expired'
   } else if (expired && (status === 'processing' || status === 'ready')) {
     status = 'expired'
   }
@@ -91,6 +93,7 @@ export async function GET(_request, { params }) {
   const payload = {
     ok: true,
     publicId: row.public_id,
+    action: row.action,
     status,
     terminal: TERMINAL.has(status),
     phone: formatE164(row.phone),
@@ -98,6 +101,7 @@ export async function GET(_request, { params }) {
     createdAt: row.created_at,
     expiresAt: row.expires_at,
     linkedAt: row.linked_at,
+    completedAt: row.completed_at,
   }
 
   if (status === 'ready' || status === 'linked') {
@@ -108,7 +112,11 @@ export async function GET(_request, { params }) {
   // Only surface a failure reason the bot explicitly recorded. Internal errors
   // are logged server-side, never forwarded.
   if (status === 'failed') {
-    payload.message = row.error || 'The pairing could not be completed. Please try again.'
+    payload.message =
+      row.error ||
+      (row.action === 'delete'
+        ? 'The device could not be removed. Please try again.'
+        : 'The pairing could not be completed. Please try again.')
   }
 
   return NextResponse.json(payload, { headers: NO_STORE })
