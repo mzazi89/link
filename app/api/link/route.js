@@ -87,16 +87,28 @@ export async function POST(request) {
   }
 
   try {
-    // Which bot this is for. An unknown name is refused rather than quietly
-    // falling back to the primary one, because a pairing that lands on the wrong
-    // bot looks successful and cannot be undone from the website.
+    // Which bot this is for.
+    //
+    // A caller that names one is held to it: an unknown name is refused rather
+    // than quietly falling back, because a pairing that lands on the wrong bot
+    // looks successful and cannot be undone from the website.
+    //
+    // A caller that names none is the request this endpoint always accepted.
+    // That is only unambiguous while there is one bot, so with several
+    // configured a choice is required rather than guessed — guessing would
+    // queue an untargeted row and then report a bot that may not be the one
+    // that takes it.
     const bots = await listBots()
     const requested = typeof body?.bot === 'string' ? body.bot.trim() : ''
-    const bot = requested ? bots.find((b) => b.id === requested) : bots[0]
+    const bot = requested ? bots.find((b) => b.id === requested) : bots.length === 1 ? bots[0] : null
 
     if (!bot) {
       return NextResponse.json(
-        { ok: false, error: 'unknown_bot', message: 'That bot is not available.' },
+        {
+          ok: false,
+          error: 'unknown_bot',
+          message: requested ? 'That bot is not available.' : 'Choose which bot to link to.',
+        },
         { status: 400, headers: NO_STORE }
       )
     }
@@ -131,8 +143,13 @@ export async function POST(request) {
     await recordRequest({ action: 'pair', phone, ipHash })
 
     // Last, because it is the only expensive step and every check above is cheap.
+    //
+    // The target is written only when the caller named one. An unnamed request
+    // stays untargeted — "any bot may take it" — which is precisely the row this
+    // endpoint wrote before bots were selectable, so a deployment that later
+    // switches a second bot on cannot strand requests queued under the old name.
     const passwordHash = await hashPassword(body.password)
-    const created = await createPairRequest(phone, passwordHash, bot.id)
+    const created = await createPairRequest(phone, passwordHash, requested ? bot.id : '')
 
     // OPTIONAL SPEED PATH. The bot finds this on its own poll (quartzxd's README
     // puts that at ~15s), so this notification does nothing on its own — quartz

@@ -99,9 +99,13 @@ CREATE INDEX IF NOT EXISTS request_log_phone_recent_idx
 --
 --   SELECT n.phone
 --     FROM (SELECT json_array_elements_text(session_numbers::json) AS phone
---             FROM bot_status WHERE bot_id = 'main') n
+--             FROM bot_status) n
 --     LEFT JOIN device_credentials c ON c.phone = n.phone
 --    WHERE c.phone IS NULL;
+--
+-- No bot_id filter: on a deployment with more than one bot, restricting this to
+-- the primary row would miss every number the other bot holds. The numbers are
+-- a set across all of them.
 --
 -- Deliberately a view rather than an API response: publishing which numbers rely
 -- on a shared default would be handing out a list of targets, so the site never
